@@ -1,7 +1,7 @@
 use crate::config::BatchParams;
 use crate::constants::B_SWITCH_SQUASH;
 use crate::constants::LOG_B_SWITCH_SQUASH;
-use crate::constants::STATSEC;
+use crate::constants::STATSEC_TUNIFORM;
 use crate::endpoints::decryption::RadixOrBoolCiphertext;
 use crate::endpoints::decryption::SnsDecryptionKeyType;
 use crate::endpoints::decryption::SnsRadixOrBoolCiphertext;
@@ -216,7 +216,10 @@ where
         num_ctxt: usize,
     ) -> anyhow::Result<InMemoryNoiseFloodPreprocessing<EXTENSION_DEGREE>> {
         let session = self.session.get_mut();
-        let num_preproc = 2 * num_ctxt * ((STATSEC + LOG_B_SWITCH_SQUASH) as usize + 2);
+        // TUniform path: sized from STATSEC_TUNIFORM (50), the large-session
+        // flooding parameter — NOT the PRSS STATSEC (40), whose ceiling is
+        // path-specific. See constants.rs.
+        let num_preproc = 2 * num_ctxt * ((STATSEC_TUNIFORM + LOG_B_SWITCH_SQUASH) as usize + 2);
         let batch_size = BatchParams {
             triples: num_preproc,
             randoms: num_preproc,
