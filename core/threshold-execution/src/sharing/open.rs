@@ -278,6 +278,25 @@ impl RobustOpen for SecureRobustOpen {
             let num_parties = session.num_parties();
             let threshold = session.threshold();
             let num_bots = session.corrupt_roles().len();
+
+            // Degree/tolerance split (same rationale as `robust_open_list_to_set`).
+            // `session.threshold()` is the corruption threshold; the error-correction
+            // *tolerance* for reconstructing a degree-`degree` sharing from
+            // `num_parties` shares is the Reed-Solomon bound floor((n - degree - 1)/2).
+            // This min is INERT whenever the session is properly provisioned for the
+            // degree: n >= degree + 2*threshold + 1  <=>  (n - degree - 1)/2 >= threshold,
+            // so every standard open (n >= 3t+1 with degree = t, and any correctly
+            // provisioned higher-degree open) is unchanged. It bites ONLY in the
+            // degree-decoupled regime — degree >> tolerance, e.g. the two-sets upward
+            // reshare's syndrome open, a degree-78 sharing among 100 tolerating e <= 10 —
+            // where it lets reconstruction proceed at the honest RS tolerance instead of
+            // demanding the impossible `degree + 2*degree < n`. Soundness requires actual
+            // corruptions <= the RS bound, which the committee model guarantees.
+            let threshold = std::cmp::min(
+                threshold as usize,
+                num_parties.saturating_sub(degree + 1) / 2,
+            ) as u8;
+
             try_reconstruct_from_shares(
                 num_parties,
                 threshold,
@@ -391,6 +410,41 @@ impl RobustOpen for SecureRobustOpen {
                         .count(),
                 ),
             };
+
+            // Degree/tolerance split. The per-set `threshold` read above is the
+            // sending set's sharing *degree* (the two-sets session carries one
+            // value per set). The error-correction *tolerance* for
+            // reconstructing a degree-`degree` sharing from `num_sending_parties`
+            // received shares is the Reed-Solomon bound e = floor((n - d - 1)/2),
+            // not the degree: robust reconstruction needs n >= degree + 2e + 1.
+            // When degree == tolerance (the usual single-degree case) this cap is
+            // inert; when the confidentiality degree exceeds the corruption
+            // tolerance — the upward-reshare case, where a degree-78 sharing is
+            // opened among 100 parties and tolerates only e <= 10 — it is what
+            // lets reconstruction proceed instead of demanding the impossible
+            // `degree + 2*degree < n`. Soundness requires actual corruptions <= e,
+            // which the committee model guarantees (the accepted robust margin).
+            let threshold = std::cmp::min(
+                threshold as usize,
+                num_sending_parties.saturating_sub(degree + 1) / 2,
+            ) as u8;
+
+            // Up-front feasibility, loud rather than opaque. A degree-`degree`
+            // sharing cannot be reconstructed from `num_sending_parties <= degree`
+            // shares at all, and the honest robust margin here is thin
+            // (e <= floor((n - degree - 1)/2)). The two-sets admission check only
+            // enforces n > per-set-threshold, which is not the reconstruction
+            // condition; refuse here with both numbers rather than aborting five
+            // layers deep with a bare "could not reconstruct".
+            if num_sending_parties <= degree {
+                return Err(anyhow_error_and_log(format!(
+                    "two-sets open is infeasible: {num_sending_parties} sending parties cannot \
+                     reconstruct a degree-{degree} sharing (need at least {} shares; robust \
+                     error tolerance would be {} correctable faults)",
+                    degree + 1,
+                    num_sending_parties.saturating_sub(degree + 1) / 2,
+                )));
+            }
 
             // Use my own share if ever I am in both sets
             let sharings = if let Some(my_shares) = my_shares {
