@@ -1,6 +1,6 @@
 use super::secret_distributions::{RealSecretDistributions, SecretDistributions};
 use super::triple::Triple;
-use crate::constants::{B_SWITCH_SQUASH, LOG_B_SWITCH_SQUASH, STATSEC};
+use crate::constants::{B_SWITCH_SQUASH, LOG_B_SWITCH_SQUASH, STATSEC_TUNIFORM};
 use crate::keyset_config::KeySetConfig;
 use crate::online::gen_bits::{BitGenEven, SecureBitGenEven};
 use crate::online::preprocessing::memory::{InMemoryBitPreprocessing, memory_factory};
@@ -178,7 +178,7 @@ where
         session: &mut BaseSession,
         num_ctxts: usize,
     ) -> anyhow::Result<()> {
-        let bound_d = (STATSEC + LOG_B_SWITCH_SQUASH) as usize;
+        let bound_d = (STATSEC_TUNIFORM + LOG_B_SWITCH_SQUASH) as usize;
         let num_bits = 2 * num_ctxts * (bound_d + 2);
         let available_bits =
             SecureBitGenEven::gen_bits_even(num_bits, preprocessing, session).await?;
@@ -194,7 +194,7 @@ where
         bit_preproc: &mut dyn BitPreprocessing<ResiduePoly<Z128, EXTENSION_DEGREE>>,
         num_ctxts: usize,
     ) -> anyhow::Result<()> {
-        let bound_d = (STATSEC + LOG_B_SWITCH_SQUASH) as usize;
+        let bound_d = (STATSEC_TUNIFORM + LOG_B_SWITCH_SQUASH) as usize;
         self.append_masks(
             RealSecretDistributions::t_uniform(2 * num_ctxts, TUniformBound(bound_d), bit_preproc)?
                 .into_iter()

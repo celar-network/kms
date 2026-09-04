@@ -918,6 +918,37 @@ mod tests {
         .await
     }
 
+    /// B7.2 — the degree/tolerance split, exercised at a config where the two
+    /// DIFFER. Set 2 has `n_s2 = 8` parties at sharing degree `threshold_set_2 = 3`.
+    /// Robust reconstruction of a degree-3 sharing among 8 shares tolerates the
+    /// Reed-Solomon bound `e = floor((8 - 3 - 1)/2) = 2`, needing `3 + 2*2 = 7 <= 8`.
+    /// The pre-patch code passed the degree (3) as BOTH degree and tolerance, so the
+    /// bar was `3 + 2*3 = 9 > 8` and the very first set-2 mask open aborted — the
+    /// c=100/d=78 wall in miniature (`n_s2 <= 3*threshold_set_2`). This case walls on
+    /// the unpatched open and must pass on the patched one; it also drives the full
+    /// reshare through the syndrome open, so a green run resolves whether that second
+    /// site was ever a wall.
+    #[tokio::test(flavor = "multi_thread")]
+    #[rstest::rstest]
+    async fn reshare_two_sets_high_degree_tolerance_split(
+        #[values(0, 2)] intersection_size: usize,
+    ) -> anyhow::Result<()> {
+        let num_parties_s1 = 7;
+        let num_parties_s2 = 8;
+        let threshold = TwoSetsThreshold {
+            threshold_set_1: 2,
+            threshold_set_2: 3,
+        };
+        simulate_reshare_two_sets::<4>(
+            false,
+            num_parties_s1,
+            num_parties_s2,
+            intersection_size,
+            threshold,
+        )
+        .await
+    }
+
     async fn simulate_reshare_same_set<const EXTENSION_DEGREE: usize>(
         add_error: bool,
         remove_share: bool,

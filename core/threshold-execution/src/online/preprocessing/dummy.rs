@@ -7,7 +7,7 @@ use super::InMemoryBitDecPreprocessing;
 use super::NoiseBounds;
 use super::NoiseFloodPreprocessing;
 use crate::constants::LOG_B_SWITCH_SQUASH;
-use crate::constants::STATSEC;
+use crate::constants::STATSEC_TUNIFORM;
 use crate::keyset_config::KeySetConfig;
 use crate::online::preprocessing::BasePreprocessing;
 use crate::online::preprocessing::RandomPreprocessing;
@@ -347,7 +347,7 @@ where
         &mut self,
         amount: usize,
     ) -> anyhow::Result<Vec<ResiduePoly<Z128, EXTENSION_DEGREE>>> {
-        let bound_d = (STATSEC + LOG_B_SWITCH_SQUASH) as usize;
+        let bound_d = (STATSEC_TUNIFORM + LOG_B_SWITCH_SQUASH) as usize;
         Ok(
             RealSecretDistributions::t_uniform::<ResiduePoly<Z128, EXTENSION_DEGREE>, _>(
                 2 * amount,
