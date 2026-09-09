@@ -2,8 +2,16 @@ use const_format::concatcp;
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "non-wasm")] {
-        /// log_2 of parameter B_{SwitchSquash}, always using the upper bound
-        pub(crate) const LOG_B_SWITCH_SQUASH: u32 = 70;
+        /// log_2 of parameter B_{SwitchSquash} — the DERIVED switch-and-squash
+        /// output-noise bound, not the loose ceiling. Evaluating the closed form
+        /// c_err,1 · sqrt(sigma_bar_BS^2 + FFTNoise) (eq. 17-bar + FFTNoise) at
+        /// the deployed noise-squashing parameters gives a bound of about
+        /// 2^67.9 with the scheme's tail-cut constant c_err,1 = 13.15 (which sets
+        /// the per-value exceedance below 2^-128); 68 is the conservative integer
+        /// above that. Previously 70, an "always use the upper bound" ceiling —
+        /// tightening it to the derived value is what frees the extra bit of
+        /// statistical security below.
+        pub(crate) const LOG_B_SWITCH_SQUASH: u32 = 68;
         pub (crate) const B_SWITCH_SQUASH: u128 = 1 << LOG_B_SWITCH_SQUASH;
 
         /// Maximum number of PRSS party sets (n choose t).
@@ -13,10 +21,11 @@ cfg_if::cfg_if! {
         /// STATSEC + 1); decryption rounds at Δ = 2^123 (u128 modulus, 4-bit
         /// message+carry, padding bit), so correctness requires the mask plus
         /// the real post-squash noise (≤ 2^LOG_B_SWITCH_SQUASH) to stay under
-        /// Δ/2 = 2^122. At STATSEC = 40 that means binom(n,t) < 2^11 — this
-        /// constant is exactly that bound, with the real noise absorbed by the
-        /// slack between 2047 and 2048. Raising it past 2047 produces silently
-        /// wrong plaintexts, not an error.
+        /// Δ/2 = 2^122. With the derived bound (LOG_B_SWITCH_SQUASH = 68) at
+        /// STATSEC = 40 the margin permits binom(n,t) < 2^13; this constant is
+        /// left at 2047 (the old tight bound under the loose 70), now
+        /// conservative rather than exact. Raising it past the true margin
+        /// produces silently wrong plaintexts, not an error.
         pub(crate) const PRSS_SIZE_MAX: usize = 2047;
 
         /// Statistical security parameter in bits — **PRSS path**.
@@ -29,14 +38,18 @@ cfg_if::cfg_if! {
         /// (large-session offline / `fill_from_bits_preproc` family).
         ///
         /// This path's mask carries NO binom(n,t) factor — it is bounded by
-        /// 2^(LOG_B_SWITCH_SQUASH + STATSEC_TUNIFORM + 1) — so its ceiling is
-        /// 50: 2^121 (mask) + 2^70 (real noise) < 2^122 (Δ/2), with 2×
-        /// headroom. 51 fails on the additive real-noise term.
+        /// 2^(LOG_B_SWITCH_SQUASH + STATSEC_TUNIFORM + 1). With the DERIVED
+        /// switch-and-squash bound (LOG_B_SWITCH_SQUASH = 68) the ceiling is 52:
+        /// 2^121 (mask) + 2^68 (real noise) < 2^122 (Δ/2), one bit of headroom.
+        /// 53 fails the margin. (Was 50 while the bound was the loose 70; the two
+        /// move together — the derived-noise tightening is exactly what pays for
+        /// the two extra bits, which raise the per-epoch decryption budget Q_max
+        /// from 2^(50−40)=1024 to 2^(52−40)=4096.)
         ///
         /// [Celar fork of c6b0fdd3: split from the global STATSEC so the
         /// large-session path can use its headroom; upstream issue proposes
         /// making this configurable properly.]
-        pub const STATSEC_TUNIFORM: u32 = 50;
+        pub const STATSEC_TUNIFORM: u32 = 52;
 
         // Compile-time ceiling checks — exceeding either bound corrupts
         // plaintexts SILENTLY (from_expanded_msg rounds into a different
@@ -44,12 +57,13 @@ cfg_if::cfg_if! {
         const _: () = assert!(
             LOG_B_SWITCH_SQUASH + STATSEC_TUNIFORM + 1 < 122,
             "TUniform flooding mask exceeds the decryption margin: \
-             2^(70 + STATSEC_TUNIFORM + 1) plus real noise must stay under Delta/2 = 2^122"
+             2^(LOG_B_SWITCH_SQUASH + STATSEC_TUNIFORM + 1) plus real noise must \
+             stay under Delta/2 = 2^122"
         );
         const _: () = assert!(
-            // 11 = ceil(log2(PRSS_SIZE_MAX + 1)); equality is permitted only
-            // because binom <= 2047 < 2048 leaves the slack that absorbs the
-            // real-noise term.
+            // 11 = ceil(log2(PRSS_SIZE_MAX + 1)). With the derived bound
+            // (LOG_B_SWITCH_SQUASH = 68) this is 68+40+1+11 = 120 <= 122, two
+            // bits of slack; it was exactly 122 while the bound was the loose 70.
             LOG_B_SWITCH_SQUASH + STATSEC + 1 + 11 <= 122,
             "PRSS flooding mask exceeds the decryption margin at PRSS_SIZE_MAX"
         );
