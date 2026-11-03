@@ -1,0 +1,672 @@
+use super::{
+    AppKeyBlob, EnvelopeLoad, EnvelopeStore, Keychain, RootKeyMeasurements, decrypt_under_data_key,
+    encrypt_under_data_key,
+};
+use crate::{
+    anyhow_error_and_log, consts::SAFE_SER_SIZE_LIMIT, cryptography::attestation::SecurityModule,
+    some_or_err,
+};
+use aes08::{
+    Aes256,
+    cipher::{BlockDecryptMut, IvSizeUser, KeyIvInit, KeySizeUser, block_padding::Pkcs7},
+};
+use anyhow::{anyhow, bail, ensure};
+use aws_config::SdkConfig;
+use aws_sdk_kms::{
+    Client as AWSKMSClient,
+    primitives::Blob,
+    types::{
+        DataKeySpec::Aes256 as Aes256Type, EncryptionAlgorithmSpec, KeyEncryptionMechanism,
+        KeySpec::Rsa4096 as Rsa4096Type, KeyUsageType::EncryptDecrypt, OriginType,
+        RecipientInfo as KMSRecipientInfo,
+    },
+};
+use iam_rs::{
+    ConditionValue, IAMAction, IAMEffect, IAMOperator, IAMPolicy, IAMResource, IAMStatement,
+    IAMVersion,
+};
+use rand::{CryptoRng, Rng};
+use rasn::{
+    ber::de::{Decoder, DecoderOptions},
+    de::Decode,
+    types::{Integer, OctetString, Oid},
+};
+use rasn_cms::{
+    CONTENT_DATA, CONTENT_ENVELOPED_DATA, ContentInfo, EnvelopedData, RecipientInfo,
+    algorithms::AES256_CBC,
+};
+use rsa::{
+    Oaep, RsaPrivateKey, RsaPublicKey,
+    pkcs8::{DecodePublicKey, EncodePublicKey},
+    sha2::Sha256,
+};
+use serde::{Serialize, de::DeserializeOwned};
+use std::sync::Arc;
+use tfhe::safe_serialization::{safe_deserialize, safe_serialize};
+use tfhe::{Unversionize, Versionize, named::Named};
+use threshold_networking::tls::ReleasePCRValues;
+use url::Url;
+
+// recipient enclave RSA keypair size
+pub const RECIPIENT_KEYPAIR_SIZE: usize = 2048;
+// AES256-GCM-SIV uses 96 bit nonces
+pub const APP_BLOB_NONCE_SIZE: usize = 12;
+// AWS KMS is expected to produce this version of the CMS structure
+const AWS_KMS_ENVELOPED_DATA_VERSION: isize = 2;
+// AWS KMS is expected to produce this version of the recipient substructure
+const AWS_KMS_ENVELOPED_DATA_RECIPIENT_VERSION: isize = 2;
+
+pub trait RootKey {
+    fn enc_algo_spec(&self) -> EncryptionAlgorithmSpec;
+
+    fn measurements(&self) -> Arc<RootKeyMeasurements>;
+}
+
+#[derive(Debug)]
+pub struct Symm {
+    pub key_id: String,
+    pub enc_algo_spec: EncryptionAlgorithmSpec,
+    pub key_measurements: Arc<RootKeyMeasurements>,
+}
+
+impl Symm {
+    pub async fn new(
+        awskms_client: AWSKMSClient,
+        key_id: String,
+        attest_key_policy: bool,
+    ) -> anyhow::Result<Self> {
+        let key_origin = get_key_origin(awskms_client.clone(), key_id.clone()).await?;
+        let key_policy = if attest_key_policy {
+            let mut key_policy = get_key_policy(awskms_client.clone(), key_id.clone()).await?;
+            canonicalize_iam_policy(&mut key_policy);
+            Some(key_policy)
+        } else {
+            None
+        };
+        Ok(Self {
+            key_id,
+            enc_algo_spec: EncryptionAlgorithmSpec::SymmetricDefault,
+            key_measurements: Arc::new(RootKeyMeasurements::AwsKms {
+                key_origin: key_origin.to_string(),
+                key_policy,
+            }),
+        })
+    }
+}
+
+impl RootKey for Symm {
+    fn enc_algo_spec(&self) -> EncryptionAlgorithmSpec {
+        self.enc_algo_spec.clone()
+    }
+
+    fn measurements(&self) -> Arc<RootKeyMeasurements> {
+        self.key_measurements.clone()
+    }
+}
+
+#[derive(Debug)]
+pub struct Asymm {
+    pub key_id: String,
+    pub enc_algo_spec: EncryptionAlgorithmSpec,
+    pub pk: RsaPublicKey,
+    pub key_measurements: Arc<RootKeyMeasurements>,
+}
+
+impl Asymm {
+    pub async fn new(
+        awskms_client: AWSKMSClient,
+        key_id: String,
+        attest_key_policy: bool,
+    ) -> anyhow::Result<Self> {
+        let key_origin = get_key_origin(awskms_client.clone(), key_id.clone()).await?;
+        let key_policy = if attest_key_policy {
+            let mut key_policy = get_key_policy(awskms_client.clone(), key_id.clone()).await?;
+            canonicalize_iam_policy(&mut key_policy);
+            Some(key_policy)
+        } else {
+            None
+        };
+        let get_public_key_response = awskms_client
+            .get_public_key()
+            .key_id(key_id.clone())
+            .send()
+            .await
+            .map_err(|e| {
+                let e1 = e.to_string();
+                let e2 = e
+                    .into_source()
+                    .unwrap_or_else(|_| "unknown AWS error".into());
+                let e3 = e2
+                    .source()
+                    .map(|e| format!(": {e}"))
+                    .unwrap_or_else(|| "".to_string());
+                anyhow!("Could not get public key: {e1}: {e2}{e3}")
+            })?;
+
+        let pk_spec = some_or_err(
+            get_public_key_response.key_spec,
+            "No key spec returned for the root public key by AWS KMS".to_string(),
+        )?;
+        ensure!(
+            pk_spec == Rsa4096Type,
+            "Root public key must be RSA4096: check AWS KMS deployment"
+        );
+
+        let pk_usage = some_or_err(
+            get_public_key_response.key_usage,
+            "No key usage returned for the root public key by AWS KMS".to_string(),
+        )?;
+        ensure!(
+            pk_usage == EncryptDecrypt,
+            "Root public key is not allowed to be used for encryption/decryption: check AWS KMS key policy"
+        );
+
+        let pk_bytes = some_or_err(
+            get_public_key_response.public_key,
+            "No public key blob returned by AWS KMS".to_string(),
+        )?;
+
+        let pk = RsaPublicKey::from_public_key_der(pk_bytes.as_ref())?;
+
+        Ok(Self {
+            key_id,
+            enc_algo_spec: EncryptionAlgorithmSpec::RsaesOaepSha256,
+            pk,
+            key_measurements: Arc::new(RootKeyMeasurements::AwsKms {
+                key_origin: key_origin.to_string(),
+                key_policy,
+            }),
+        })
+    }
+}
+
+impl RootKey for Asymm {
+    fn enc_algo_spec(&self) -> EncryptionAlgorithmSpec {
+        self.enc_algo_spec.clone()
+    }
+
+    fn measurements(&self) -> Arc<RootKeyMeasurements> {
+        self.key_measurements.clone()
+    }
+}
+
+/// Keeps together everything needed for running a chain of trust for working
+/// with application secret keys (such as FHE private keys). The root key
+/// encrypt data keys which encrypt application keys. The root key is stored in
+/// AWS KMS and never leaves it. Encrypted application keys (together with the
+/// corresponding data keys) are stored on S3. The enclave keypair permits
+/// secure decryption of data keys by AWS KMS.
+#[derive(Debug, Clone)]
+pub struct AWSKMSKeychain<S: SecurityModule, K: RootKey, R: Rng + CryptoRng> {
+    rng: R,
+    awskms_client: AWSKMSClient,
+    security_module: Arc<S>,
+    recipient_sk: RsaPrivateKey,
+    recipient_pk: RsaPublicKey,
+    root_key: K,
+}
+
+impl<S: SecurityModule, K: RootKey, R: Rng + CryptoRng> AWSKMSKeychain<S, K, R> {
+    pub fn new(
+        mut rng: R,
+        awskms_client: AWSKMSClient,
+        security_module: Arc<S>,
+        root_key: K,
+    ) -> anyhow::Result<Self> {
+        let recipient_sk = RsaPrivateKey::new(&mut rng, RECIPIENT_KEYPAIR_SIZE)?;
+        let recipient_pk = RsaPublicKey::from(&recipient_sk);
+        Ok(AWSKMSKeychain {
+            rng,
+            awskms_client,
+            security_module,
+            recipient_sk,
+            recipient_pk,
+            root_key,
+        })
+    }
+
+    /// Requests the AWS KMS to decrypt a data key using a root key (managed by AWS KMS) and uses that
+    /// data key to decrypt an application key (such as an FHE private key).
+    async fn decrypt<T: DeserializeOwned + Unversionize + Named + Send>(
+        &self,
+        envelope: &mut AppKeyBlob,
+    ) -> anyhow::Result<T> {
+        // request enclave attestation before making an AWS KMS request, so the
+        // attestation is fresh and not older than 5 minutes
+        let attestation = self
+            .security_module
+            .attest(self.recipient_pk.to_public_key_der()?.to_vec(), None)
+            .await
+            .map_err(|e| anyhow!("Could not attest enclave public key: {e}"))?;
+
+        // decrypt the data key under which the app key was encrypted
+        let decrypt_data_key_response = self
+            .awskms_client
+            .decrypt()
+            .key_id(&envelope.root_key_id)
+            .ciphertext_blob(Blob::new(envelope.data_key_blob.clone()))
+            .encryption_algorithm(self.root_key.enc_algo_spec())
+            .recipient(
+                KMSRecipientInfo::builder()
+                    .key_encryption_algorithm(KeyEncryptionMechanism::RsaesOaepSha256)
+                    .attestation_document(Blob::new(attestation))
+                    .build(),
+            )
+            .send()
+            .await
+            .map_err(|e| {
+                let e1 = e.to_string();
+                let e2 = e
+                    .into_source()
+                    .unwrap_or_else(|_| "unknown AWS error".into());
+                let e3 = e2
+                    .source()
+                    .map(|e| format!(": {e}"))
+                    .unwrap_or_else(|| "".to_string());
+                anyhow!("Could not decrypt data key: {e1}: {e2}{e3}")
+            })?;
+        let decrypt_data_key_response_ciphertext_bytes = some_or_err(
+            decrypt_data_key_response.ciphertext_for_recipient,
+            "No blob returned in decryption response from AWS".to_string(),
+        )?;
+        let data_key = decrypt_ciphertext_for_recipient(
+            decrypt_data_key_response_ciphertext_bytes.into_inner(),
+            &self.recipient_sk,
+        )?;
+
+        // decrypt the app key
+        decrypt_under_data_key(
+            &mut envelope.ciphertext,
+            &data_key,
+            &envelope.iv,
+            &envelope.auth_tag,
+        )?;
+        let mut buf = std::io::Cursor::new(&envelope.ciphertext);
+        safe_deserialize::<T>(&mut buf, SAFE_SER_SIZE_LIMIT)
+            .map_err(|e| anyhow::anyhow!("Could not deserialize backed up ciphertext: {e}"))
+    }
+
+    fn root_key_measurements(&self) -> Arc<RootKeyMeasurements> {
+        self.root_key.measurements()
+    }
+}
+
+impl<S: SecurityModule + Sync + Send, R: Rng + CryptoRng> Keychain for AWSKMSKeychain<S, Symm, R> {
+    /// Request a data key from AWS KMS and encrypt an application key (such as the FHE private key) on
+    /// it. Stores a copy of the data key encrypted on the root key (stored in AWS KMS) together with
+    /// the encrypted application key.
+    async fn encrypt<T: Serialize + Versionize + Named + Send + Sync>(
+        &mut self,
+        data: &T,
+        _data_type: &str,
+    ) -> anyhow::Result<EnvelopeStore> {
+        // request enclave attestation before making an AWS KMS request, so the
+        // attestation is fresh and not older than 5 minutes
+        let attestation = self
+            .security_module
+            .attest(self.recipient_pk.to_public_key_der()?.to_vec(), None)
+            .await
+            .map_err(|e| anyhow!("Could not attest enclave public key: {e}"))?;
+
+        // request the data key from AWS KMS to encrypt the app key
+        let gen_data_key_response = self
+            .awskms_client
+            .generate_data_key()
+            .key_id(&self.root_key.key_id)
+            .key_spec(Aes256Type)
+            .recipient(
+                KMSRecipientInfo::builder()
+                    .key_encryption_algorithm(KeyEncryptionMechanism::RsaesOaepSha256)
+                    .attestation_document(Blob::new(attestation))
+                    .build(),
+            )
+            .send()
+            .await
+            .map_err(|e| {
+                let e1 = e.to_string();
+                let e2 = e
+                    .into_source()
+                    .unwrap_or_else(|_| "unknown AWS error".into());
+                let e3 = e2
+                    .source()
+                    .map(|e| format!(": {e}"))
+                    .unwrap_or_else(|| "".to_string());
+                anyhow!("Could not generate data key: {e1}: {e2}{e3}")
+            })?;
+
+        // decrypt the data key with the Nitro enclave private key
+        let gen_data_key_response_ciphertext_blob = some_or_err(
+            gen_data_key_response.ciphertext_for_recipient,
+            "No ciphertext for recipient returned in data key generation response from AWS KMS"
+                .to_string(),
+        )?;
+        let data_key = decrypt_ciphertext_for_recipient(
+            gen_data_key_response_ciphertext_blob.into_inner(),
+            &self.recipient_sk,
+        )?;
+        // encrypt the app key under the data key
+        let mut blob_bytes = Vec::new();
+        safe_serialize(data, &mut blob_bytes, SAFE_SER_SIZE_LIMIT)?;
+        // encrypt the app key under the data key
+        let iv = self.security_module.get_random(APP_BLOB_NONCE_SIZE).await?;
+        let auth_tag = encrypt_under_data_key(&mut blob_bytes, &data_key, &iv)?;
+        Ok(EnvelopeStore::AppKeyBlob(AppKeyBlob {
+            root_key_id: self.root_key.key_id.to_string(),
+            data_key_blob: some_or_err(
+                gen_data_key_response.ciphertext_blob,
+                "No ciphertext blob returned in data key generation response from AWS KMS"
+                    .to_string(),
+            )?
+            .into_inner(),
+            ciphertext: blob_bytes,
+            iv,
+            auth_tag,
+        }))
+    }
+
+    async fn decrypt<T: DeserializeOwned + Unversionize + Named + Send>(
+        &self,
+        envelope: &mut EnvelopeLoad,
+    ) -> anyhow::Result<T> {
+        AWSKMSKeychain::<S, Symm, R>::decrypt(
+            self,
+            &mut envelope
+                .clone()
+                .try_as_app_key_blob()
+                .ok_or_else(|| anyhow::anyhow!("Expected single share encrypted data"))?,
+        )
+        .await
+    }
+
+    fn root_key_measurements(&self) -> Arc<RootKeyMeasurements> {
+        AWSKMSKeychain::<S, Symm, R>::root_key_measurements(self)
+    }
+}
+
+impl<S: SecurityModule + Sync + Send, R: Rng + CryptoRng> Keychain for AWSKMSKeychain<S, Asymm, R> {
+    async fn encrypt<T: Serialize + Versionize + Named + Send + Sync>(
+        &mut self,
+        data: &T,
+        _data_type: &str,
+    ) -> anyhow::Result<EnvelopeStore> {
+        // generate a fresh data key
+        let data_key = self.security_module.get_random(Aes256::key_size()).await?;
+        let enc_data_key = self
+            .root_key
+            .pk
+            .encrypt(&mut self.rng, Oaep::new::<Sha256>(), data_key.as_ref())
+            .map_err(|e| anyhow_error_and_log(format!("Cannot encrypt data key: {e}")))?;
+        // encrypt the app key under the data key
+        let mut blob_bytes = Vec::new();
+        safe_serialize(data, &mut blob_bytes, SAFE_SER_SIZE_LIMIT)?;
+        let iv = self.security_module.get_random(APP_BLOB_NONCE_SIZE).await?;
+        let auth_tag = encrypt_under_data_key(&mut blob_bytes, &data_key, &iv)?;
+        Ok(EnvelopeStore::AppKeyBlob(AppKeyBlob {
+            root_key_id: self.root_key.key_id.clone(),
+            data_key_blob: enc_data_key,
+            ciphertext: blob_bytes,
+            iv,
+            auth_tag,
+        }))
+    }
+
+    async fn decrypt<T: DeserializeOwned + Unversionize + Named + Send>(
+        &self,
+        envelope: &mut EnvelopeLoad,
+    ) -> anyhow::Result<T> {
+        AWSKMSKeychain::<S, Asymm, R>::decrypt(
+            self,
+            &mut envelope
+                .clone()
+                .try_as_app_key_blob()
+                .ok_or_else(|| anyhow::anyhow!("Expected single share encrypted value"))?,
+        )
+        .await
+    }
+
+    fn root_key_measurements(&self) -> Arc<RootKeyMeasurements> {
+        AWSKMSKeychain::<S, Asymm, R>::root_key_measurements(self)
+    }
+}
+
+/// Constructs an AWS KMS client for use inside of a Nitro enclave.
+pub async fn build_aws_kms_client(
+    aws_sdk_config: &SdkConfig,
+    aws_kms_endpoint: Option<Url>,
+) -> AWSKMSClient {
+    let awskms_config = match aws_kms_endpoint {
+        Some(p) => aws_sdk_kms::config::Builder::from(aws_sdk_config)
+            .endpoint_url(p)
+            .build(),
+        None => aws_sdk_kms::config::Builder::from(aws_sdk_config).build(),
+    };
+    AWSKMSClient::from_conf(awskms_config)
+}
+
+/// If a Nitro enclave attestation document is attached to a AWS KMS request,
+/// the response will contain all plaintext values encrypted on the enclave
+/// public key. This function allows for their decryption using the enclave
+/// private key. In a better world, there would be a Nitro Enclave SDK for Rust
+/// that implements this function. Alas, only the C SDK currently exists.
+pub fn decrypt_ciphertext_for_recipient(
+    ciphertext: Vec<u8>,
+    recipient_sk: &RsaPrivateKey,
+) -> anyhow::Result<Vec<u8>> {
+    // peek inside of the top-level message and check that it contains PKCS7
+    // Enveloped Data
+    let mut cms_decoder = Decoder::new(ciphertext.as_slice(), DecoderOptions::ber());
+    let cms = ContentInfo::decode(&mut cms_decoder)?;
+    ensure!(
+        cms.content_type == CONTENT_ENVELOPED_DATA,
+        "User decrypted ciphertext content must be PKCS#7 Enveloped Data, actual content type: {}",
+        cms.content_type
+    );
+    let mut envelope_decoder = Decoder::new(cms.content.as_ref(), DecoderOptions::ber());
+    let envelope = EnvelopedData::decode(&mut envelope_decoder)?;
+
+    // validate the PKCS7 envelope
+    ensure!(
+        envelope.version == Integer::from(AWS_KMS_ENVELOPED_DATA_VERSION),
+        "User decrypted ciphertext envelope must have version {}, actual version: {}",
+        AWS_KMS_ENVELOPED_DATA_VERSION,
+        envelope.version
+    );
+    ensure!(
+        envelope.recipient_infos.len() == 1,
+        "User decrypted ciphertext envelope must have exactly one recipient"
+    );
+    let RecipientInfo::KeyTransRecipientInfo(ktri) =
+        envelope.recipient_infos.to_vec().pop().unwrap()
+    else {
+        bail!("User decrypted ciphertext envelope does not contain a recipient");
+    };
+    ensure!(
+        ktri.version == Integer::from(AWS_KMS_ENVELOPED_DATA_RECIPIENT_VERSION),
+        "User decrypted ciphertext envelope recipient info must have version {}, actual version: {}",
+        AWS_KMS_ENVELOPED_DATA_RECIPIENT_VERSION,
+        ktri.version
+    );
+    ensure!(
+        ktri.key_encryption_algorithm.algorithm == Oid::ISO_MEMBER_BODY_US_RSADSI_PKCS1_RSAES_OAEP,
+        "User decrypted ciphertext envelope must use RSA-OAEP for envelope encryption, actual algorithm: {}",
+        ktri.key_encryption_algorithm.algorithm
+    );
+    ensure!(
+        envelope.encrypted_content_info.content_type == CONTENT_DATA,
+        "User decrypted ciphertext envelope content must be PKCS#7 Data, actual content type: {}",
+        envelope.encrypted_content_info.content_type
+    );
+    ensure!(
+        envelope
+            .encrypted_content_info
+            .content_encryption_algorithm
+            .algorithm
+            == AES256_CBC,
+        "User decrypted ciphertext envelope must use AES-256-CBC for content encryption, actual algorithm: {}",
+        envelope
+            .encrypted_content_info
+            .content_encryption_algorithm
+            .algorithm
+    );
+    let enc_session_key = ktri.encrypted_key.as_ref();
+    let Some(iv_string) = envelope
+        .encrypted_content_info
+        .content_encryption_algorithm
+        .parameters
+    else {
+        bail!(
+            "User decrypted ciphertext envelope does not contain an AES-256-CBC initialization vector"
+        )
+    };
+    let Some(enc_payload) = envelope.encrypted_content_info.encrypted_content else {
+        bail!("User decrypted ciphertext envelope does not contain a payload")
+    };
+
+    // decrypt the PKCS7 envelope session key
+    // RSA-OAEP-SHA256 is the only choice supported by AWS KMS
+    let session_key = recipient_sk
+        .decrypt(Oaep::new::<Sha256>(), enc_session_key)
+        .map_err(|e| {
+            anyhow_error_and_log(format!("Cannot decrypt PKCS7 envelope session key: {e}"))
+        })?;
+    ensure!(
+        session_key.len() == Aes256::key_size(),
+        "User decrypted ciphertext envelope session key is not {} bits long, actual length: {} bits",
+        Aes256::key_size() * 8,
+        session_key.len() * 8
+    );
+
+    // decode the initialization vector from ASN.1
+    let mut iv_decoder = Decoder::new(iv_string.as_ref(), DecoderOptions::ber());
+    let iv = OctetString::decode(&mut iv_decoder)?;
+    ensure!(
+        iv.len() == cbc::Decryptor::<Aes256>::iv_size(),
+        "User decrypted ciphertext envelope initialization vector is not {} bits long, actual length: {} bits",
+        cbc::Decryptor::<Aes256>::iv_size() * 8,
+        iv.len() * 8
+    );
+
+    // decrypt the ciphertext for recipient enclave
+    // AES256-CBC is the only choice supported by AWS KMS
+    let plaintext = cbc::Decryptor::<Aes256>::new_from_slices(session_key.as_slice(), iv.as_ref())?
+        .decrypt_padded_vec_mut::<Pkcs7>(enc_payload.as_ref())
+        .map_err(|e| {
+            anyhow_error_and_log(format!("Cannot decrypt ciphertext for recipient: {e}"))
+        })?;
+    Ok(plaintext)
+}
+
+async fn get_key_origin(awskms_client: AWSKMSClient, key_id: String) -> anyhow::Result<OriginType> {
+    let describe_key_response = awskms_client.describe_key().key_id(&key_id).send().await?;
+    let key_origin = describe_key_response
+        .key_metadata
+        .ok_or_else(|| anyhow_error_and_log(format!("Cannot get metadata for root key {key_id}")))?
+        .origin
+        .ok_or_else(|| {
+            anyhow_error_and_log(format!("Cannot determine origin of root key {key_id}"))
+        })?;
+    Ok(key_origin)
+}
+
+async fn get_key_policy(awskms_client: AWSKMSClient, key_id: String) -> anyhow::Result<IAMPolicy> {
+    let get_key_policy_response = awskms_client
+        .get_key_policy()
+        .key_id(&key_id)
+        .send()
+        .await?;
+    let key_policy_json = get_key_policy_response.policy.ok_or_else(|| {
+        anyhow_error_and_log(format!("Cannot determine key policy for root key {key_id}"))
+    })?;
+    let key_policy = IAMPolicy::from_json(&key_policy_json).map_err(|e| {
+        anyhow_error_and_log(format!(
+            "Cannot parse key policy for root key {key_id}: {e}"
+        ))
+    })?;
+    Ok(key_policy)
+}
+
+/// We're interested in comparing the policy structure only, not the identifiers
+/// specific to each separate deployments, which is why we have to erase them
+/// before comparison.
+pub(crate) fn canonicalize_iam_policy(policy: &mut IAMPolicy) {
+    policy.id = None;
+    for st in &mut policy.statement {
+        st.principal = None
+    }
+}
+
+/// Given the PCR values, produces a key policy for the private vault root key
+/// in the canonical form (that is, without principal names that would be
+/// different between deployments). This policy makes the key use (Decrypt and
+/// GenerateDataKey) contingent on AWS Nitro attestation but also allows the
+/// administrators to update the policy, for example, when a new software build
+/// with new PCR values is deployed. It also permits some operations that the
+/// nodes need to perform but that do not require attestation.
+pub fn make_root_key_policy(pcr_values: ReleasePCRValues) -> IAMPolicy {
+    IAMPolicy::with_version(IAMVersion::V20121017)
+        .with_id("storage_root_key")
+        .add_statement(
+            // Intended to be granted to "everyone"
+            IAMStatement::new(IAMEffect::Allow)
+                .with_sid("public")
+                .with_action(IAMAction::Multiple(vec![
+                    // Used for key policy attestation
+                    "kms:DescribeKey".to_string(),
+                    "kms:GetKeyPolicy".to_string(),
+                    // Used for private material encryption with asymmetric keys
+                    "kms:GetPublicKey".to_string(),
+                ]))
+                .with_resource(IAMResource::Single("*".to_string())),
+        )
+        .add_statement(
+            // Intented to be granted to the node IAM roles or service accounts
+            IAMStatement::new(IAMEffect::Allow)
+                .with_sid("enclave")
+                .with_action(IAMAction::Multiple(vec![
+                    // Used for private material decryption with both symmetric
+                    // and asymmetric keys
+                    "kms:Decrypt".to_string(),
+                    // Used for private material encryption with symmetric keys
+                    "kms:GenerateDataKey".to_string(),
+                ]))
+                .with_resource(IAMResource::Single("*".to_string()))
+                .with_condition(
+                    IAMOperator::StringEqualsIgnoreCase,
+                    "kms:RecipientAttestation:ImageSha384".to_string(),
+                    ConditionValue::String(hex::encode(&pcr_values.pcr0)),
+                )
+                .with_condition(
+                    IAMOperator::StringEqualsIgnoreCase,
+                    "kms:RecipientAttestation:PCR0".to_string(),
+                    ConditionValue::String(hex::encode(&pcr_values.pcr0)),
+                )
+                .with_condition(
+                    IAMOperator::StringEqualsIgnoreCase,
+                    "kms:RecipientAttestation:PCR1".to_string(),
+                    ConditionValue::String(hex::encode(&pcr_values.pcr1)),
+                )
+                .with_condition(
+                    IAMOperator::StringEqualsIgnoreCase,
+                    "kms:RecipientAttestation:PCR2".to_string(),
+                    ConditionValue::String(hex::encode(&pcr_values.pcr2)),
+                ),
+        )
+        .add_statement(
+            // Intended to be granted to infra admins only
+            IAMStatement::new(IAMEffect::Allow)
+                .with_sid("infra")
+                .with_action(IAMAction::Multiple(vec![
+                    "kms:CreateKey".to_string(),
+                    "kms:DescribeKey".to_string(),
+                    "kms:DisableKey".to_string(),
+                    "kms:EnableKey".to_string(),
+                    "kms:GetKeyPolicy".to_string(),
+                    "kms:PutKeyPolicy".to_string(),
+                    "kms:ListKeyPolicies".to_string(),
+                    "kms:ListKeys".to_string(),
+                    "kms:ScheduleKeyDeletion".to_string(),
+                    "kms:CancelKeyDeletion".to_string(),
+                ]))
+                .with_resource(IAMResource::Single("*".to_string())),
+        )
+}

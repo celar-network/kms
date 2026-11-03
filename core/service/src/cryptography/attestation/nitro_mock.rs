@@ -1,0 +1,27 @@
+use super::SecurityModule;
+
+use nsm_nitro_enclave_utils::{
+    api::nsm::{Request, Response},
+    driver::{Driver, dev::DevNitro},
+};
+use rand::{RngCore, rngs::OsRng};
+
+impl SecurityModule for DevNitro {
+    async fn attest(&self, pk: Vec<u8>, user_data: Option<Vec<u8>>) -> anyhow::Result<Vec<u8>> {
+        let request = Request::Attestation {
+            public_key: Some(pk.into()),
+            user_data: user_data.map(|x| x.into()),
+            nonce: None,
+        };
+        let Response::Attestation { document } = self.process_request(request) else {
+            anyhow::bail!("Mock Nitro enclave attestation request failed");
+        };
+        Ok(document)
+    }
+
+    async fn get_random(&self, num_bytes: usize) -> anyhow::Result<Vec<u8>> {
+        let mut vec = Vec::with_capacity(num_bytes);
+        OsRng.try_fill_bytes(&mut vec)?;
+        Ok(vec)
+    }
+}

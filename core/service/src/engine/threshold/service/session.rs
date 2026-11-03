@@ -1,0 +1,1274 @@
+// === Standard Library ===
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    hash::Hash,
+    sync::{Arc, Weak},
+};
+
+use crate::{
+    engine::{
+        context::ContextInfo, threshold::service::epoch_manager::EpochData, utils::MetricedError,
+    },
+    vault::storage::{Storage, StorageExt, crypto_material::ThresholdCryptoMaterialStorage},
+};
+
+// === External Crates ===
+use aes_prng::AesRng;
+use algebra::galois_rings::degree_4::{ResiduePolyF4Z64, ResiduePolyF4Z128};
+use kms_grpc::{EpochId, RequestId, identifiers::ContextId};
+use threshold_execution::{
+    runtime::sessions::{
+        base_session::{BaseSession, TwoSetsBaseSession},
+        session_parameters::{
+            GenericParameterHandles, SessionParameters, TwoSetsSessionParameters,
+        },
+        small_session::SmallSession,
+    },
+    small_execution::prss::{DerivePRSSState, PRSSSetup},
+};
+use threshold_networking::{
+    grpc::GrpcNetworkingManager, health_check::HealthCheckSession, tls::AttestedVerifier,
+};
+// Only used by the `#[cfg(test)]` dummy-session constructors below.
+#[cfg(test)]
+use threshold_networking::grpc::CoreToCoreNetworkConfig;
+use threshold_types::role::{DualRole, Role, TwoSetsRole, TwoSetsThreshold};
+
+use rand::{RngCore, SeedableRng};
+use serde::{Deserialize, Serialize};
+use tfhe::Versionize;
+use tfhe_versionable::VersionsDispatch;
+use thiserror::Error;
+use threshold_types::session_id::SessionId;
+use threshold_types::{
+    network::NetworkMode,
+    party::{Identity, MpcIdentity, RoleAssignment},
+};
+use tokio::sync::{Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
+use tonic::Code;
+
+struct Context {
+    // I may not belong to all the contexts I am aware of
+    // especially in the case of resharing where I only belong
+    // in one of the two contexts at play.
+    my_role: Option<Role>,
+    // A Context always hold only a RoleAssignment on Role
+    // to build a RoleAssignment on a TwoSetRole,
+    // we need 2 contexts
+    role_assignment: RoleAssignment<Role>,
+    threshold: u8,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, VersionsDispatch)]
+pub enum PRSSSetupCombinedVersions {
+    V0(PRSSSetupCombined),
+}
+
+/// Public because it's used by storage.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Versionize)]
+#[versionize(PRSSSetupCombinedVersions)]
+pub struct PRSSSetupCombined {
+    pub prss_setup_z64: PRSSSetup<ResiduePolyF4Z64>,
+    pub prss_setup_z128: PRSSSetup<ResiduePolyF4Z128>,
+    pub num_parties: u8,
+    pub threshold: u8,
+}
+
+impl tfhe::named::Named for PRSSSetupCombined {
+    const NAME: &'static str = "kms::PRSSSetupCombined";
+}
+
+type ContextMap = HashMap<ContextId, Context>;
+
+/// Hands out one lock per ID, keyed by the identifier type of the guarded resource.
+///
+/// Weak entries ensure rejected requests for random IDs do not grow the registry forever.
+/// The owned lock guards taken by the callers keep their lock alive for exactly the lifecycle
+/// operation.
+#[derive(Clone)]
+struct LockRegistry<Id> {
+    locks: Arc<Mutex<HashMap<Id, Weak<RwLock<()>>>>>,
+}
+
+// Hand-written because `#[derive(Default)]` would add a spurious `Id: Default` bound.
+impl<Id> Default for LockRegistry<Id> {
+    fn default() -> Self {
+        Self {
+            locks: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl<Id: Copy + Eq + Hash> LockRegistry<Id> {
+    async fn lock(&self, id: &Id) -> Arc<RwLock<()>> {
+        let mut locks = self.locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(id).and_then(Weak::upgrade) {
+            return lock;
+        }
+
+        let lock = Arc::new(RwLock::new(()));
+        locks.insert(*id, Arc::downgrade(&lock));
+        lock
+    }
+}
+
+#[derive(Clone, Default)]
+struct LifecycleCoordinator {
+    context_locks: LockRegistry<ContextId>,
+    epoch_locks: LockRegistry<EpochId>,
+}
+
+/// Identifies the lifecycle resource that is already held by a conflicting operation.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub(crate) enum LifecycleConflict {
+    /// A context is being destroyed while an epoch creation wants to use it, or vice versa.
+    #[error("MPC context {0} has a conflicting lifecycle operation in progress")]
+    Context(ContextId),
+    /// An epoch is being created while it is being destroyed, or vice versa.
+    #[error("epoch {0} has a conflicting lifecycle operation in progress")]
+    Epoch(EpochId),
+}
+
+/// Keeps an epoch creation mutually exclusive with destruction of its epoch and context.
+#[derive(Debug)]
+pub(crate) struct EpochCreationLease {
+    _context: OwnedRwLockReadGuard<()>,
+    _epoch: OwnedRwLockReadGuard<()>,
+}
+
+/// Prevents epoch creation for a context while that context and its epochs are destroyed.
+#[derive(Debug)]
+pub(crate) struct ContextDestructionLease {
+    _context: OwnedRwLockWriteGuard<()>,
+}
+
+/// Prevents creation of an epoch while that epoch is destroyed.
+#[derive(Debug)]
+pub(crate) struct EpochDestructionLease {
+    _epoch: OwnedRwLockWriteGuard<()>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SessionMaker {
+    networking_manager: Arc<RwLock<GrpcNetworkingManager>>,
+    context_map: Arc<RwLock<ContextMap>>,
+    epoch_map: Arc<RwLock<HashMap<EpochId, EpochData>>>,
+    lifecycle: LifecycleCoordinator,
+    verifier: Option<Arc<AttestedVerifier>>, // optional as it's not used when there's no TLS
+    rng: Arc<Mutex<AesRng>>,
+}
+
+/// The role assignment shared by all dummy contexts used in tests: four parties on localhost.
+#[cfg(test)]
+fn four_party_dummy_role_assignment() -> RoleAssignment<Role> {
+    RoleAssignment {
+        inner: HashMap::from_iter((1..=4).map(|i| {
+            (
+                Role::indexed_from_one(i),
+                Identity::new("localhost".to_string(), 8080 + i as u16, None),
+            )
+        })),
+    }
+}
+
+impl SessionMaker {
+    pub(crate) async fn new_initialized<
+        PubS: Storage + Sync + Send + 'static,
+        PrivS: StorageExt + Sync + Send + 'static,
+    >(
+        my_id: Option<Role>,
+        crypto_storage: &ThresholdCryptoMaterialStorage<PubS, PrivS>,
+        networking_manager: Arc<RwLock<GrpcNetworkingManager>>,
+        verifier: Option<Arc<AttestedVerifier>>,
+        rng: AesRng,
+    ) -> anyhow::Result<Self> {
+        let session_maker: SessionMaker =
+            Self::new_uninitialized(networking_manager, verifier, rng);
+        let all_epochs = crypto_storage.read_all_epoch_data().await?;
+        if all_epochs.is_empty() {
+            tracing::warn!(
+                "No epoch data found in storage. You may need to call the init end-point later before you can use the KMS server"
+            );
+        }
+        for (epoch_id, prss) in all_epochs {
+            session_maker.add_epoch(epoch_id, prss).await;
+            tracing::info!(
+                "Loaded epoch data from storage for request ID {}.",
+                epoch_id
+            );
+        }
+        let mpc_contexts = crypto_storage.inner.read_all_context_info().await?;
+        if mpc_contexts.is_empty() {
+            tracing::warn!(
+                "No MPC context found in storage! There should at a minimum be a default context!"
+            );
+        }
+        for context_info in mpc_contexts {
+            session_maker.add_context_info(my_id, &context_info).await?;
+            tracing::info!(
+                "Loaded MPC context from storage for context ID {}.",
+                context_info.context_id()
+            );
+        }
+        Ok(session_maker)
+    }
+
+    pub(crate) fn new_uninitialized(
+        networking_manager: Arc<RwLock<GrpcNetworkingManager>>,
+        verifier: Option<Arc<AttestedVerifier>>,
+        rng: AesRng,
+    ) -> Self {
+        Self {
+            networking_manager,
+            context_map: Arc::new(RwLock::new(HashMap::new())),
+            epoch_map: Arc::new(RwLock::new(HashMap::new())),
+            lifecycle: LifecycleCoordinator::default(),
+            verifier,
+            rng: Arc::new(Mutex::new(rng)),
+        }
+    }
+
+    /// Reserve `context_id` and `epoch_id` for an epoch creation.
+    ///
+    /// The returned lease must live until the creation task has finished every persistent write.
+    /// Destruction uses exclusive leases for the same IDs and therefore fails while this lease is
+    /// alive.
+    pub(crate) async fn try_get_epoch_creation_lease(
+        &self,
+        context_id: &ContextId,
+        epoch_id: &EpochId,
+    ) -> Result<EpochCreationLease, LifecycleConflict> {
+        let context = self.lifecycle.context_locks.lock(context_id).await;
+        let context = context
+            .try_read_owned()
+            .map_err(|_| LifecycleConflict::Context(*context_id))?;
+
+        let epoch = self.lifecycle.epoch_locks.lock(epoch_id).await;
+        let epoch = epoch
+            .try_read_owned()
+            .map_err(|_| LifecycleConflict::Epoch(*epoch_id))?;
+
+        Ok(EpochCreationLease {
+            _context: context,
+            _epoch: epoch,
+        })
+    }
+
+    /// Exclusively reserve a context for destruction.
+    ///
+    /// The caller must retain the lease while taking the epoch snapshot, deleting every associated
+    /// epoch, and deleting the context itself. Acquiring it fails while an epoch creation for this
+    /// context is in flight.
+    pub(crate) async fn try_get_context_destruction_lease(
+        &self,
+        context_id: &ContextId,
+    ) -> Result<ContextDestructionLease, LifecycleConflict> {
+        let context = self.lifecycle.context_locks.lock(context_id).await;
+        let context = context
+            .try_write_owned()
+            .map_err(|_| LifecycleConflict::Context(*context_id))?;
+        Ok(ContextDestructionLease { _context: context })
+    }
+
+    /// Exclusively reserve an epoch for destruction.
+    ///
+    /// Acquiring this lease fails while creation of the same epoch is in flight. The caller must
+    /// retain it through all storage and cache deletion.
+    pub(crate) async fn try_get_epoch_destruction_lease(
+        &self,
+        epoch_id: &EpochId,
+    ) -> Result<EpochDestructionLease, LifecycleConflict> {
+        let epoch = self.lifecycle.epoch_locks.lock(epoch_id).await;
+        let epoch = epoch
+            .try_write_owned()
+            .map_err(|_| LifecycleConflict::Epoch(*epoch_id))?;
+        Ok(EpochDestructionLease { _epoch: epoch })
+    }
+
+    /// Returns the number of active sessions.
+    pub async fn active_sessions(&self) -> u64 {
+        let reader_guard = self.networking_manager.read().await;
+        reader_guard.active_session_count().await
+    }
+
+    /// Returns the number of inactive sessions.
+    pub async fn inactive_sessions(&self) -> u64 {
+        let reader_guard = self.networking_manager.read().await;
+        reader_guard.inactive_session_count().await
+    }
+
+    /// Return the epoch Ids associated with a given context Id.
+    pub async fn epochs_for_context(&self, context_id: &ContextId) -> Vec<EpochId> {
+        let epoch_map = self.epoch_map.read().await;
+        epoch_map
+            .iter()
+            .filter_map(|(epoch_id, epoch_data)| {
+                (epoch_data.context_id == *context_id).then_some(*epoch_id)
+            })
+            .collect()
+    }
+
+    pub(crate) async fn context_count(&self) -> usize {
+        self.context_map.read().await.len()
+    }
+
+    pub(crate) async fn epoch_count(&self) -> usize {
+        self.epoch_map.read().await.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty_dummy_session(rng: AesRng) -> Self {
+        let networking_manager = Arc::new(RwLock::new(
+            GrpcNetworkingManager::new(None, CoreToCoreNetworkConfig::default()).unwrap(),
+        ));
+        Self {
+            networking_manager,
+            context_map: Arc::new(RwLock::new(HashMap::new())),
+            epoch_map: Arc::new(RwLock::new(HashMap::new())),
+            lifecycle: LifecycleCoordinator::default(),
+            verifier: None,
+            rng: Arc::new(Mutex::new(rng)),
+        }
+    }
+
+    /// Registers an extra dummy four party context (same identities and threshold as
+    /// [`Self::four_party_dummy_session`]) so tests can target a context other than
+    /// [`crate::consts::DEFAULT_MPC_CONTEXT`], e.g. as the destination context of a reshare.
+    #[cfg(test)]
+    pub(crate) async fn add_four_party_dummy_context(&self, context_id: ContextId) {
+        self.add_context(
+            context_id,
+            Some(Role::indexed_from_one(1)),
+            four_party_dummy_role_assignment(),
+            1,
+        )
+        .await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn four_party_dummy_session(
+        prss_setup_z128: Option<PRSSSetup<ResiduePolyF4Z128>>,
+        prss_setup_z64: Option<PRSSSetup<ResiduePolyF4Z64>>,
+        epoch_id: &EpochId,
+        rng: AesRng,
+    ) -> Self {
+        let role_assignment = four_party_dummy_role_assignment();
+        let networking_manager = Arc::new(RwLock::new(
+            GrpcNetworkingManager::new(None, CoreToCoreNetworkConfig::default()).unwrap(),
+        ));
+
+        let default_context_id = *crate::consts::DEFAULT_MPC_CONTEXT;
+        let default_context = Context {
+            threshold: 1,
+            my_role: Some(Role::indexed_from_one(1)),
+            role_assignment,
+        };
+
+        let default_epoch = match (prss_setup_z128, prss_setup_z64) {
+            (Some(z128), Some(z64)) => Some(EpochData {
+                context_id: default_context_id,
+                prss: PRSSSetupCombined {
+                    prss_setup_z128: z128,
+                    prss_setup_z64: z64,
+                    num_parties: 4,
+                    threshold: 1,
+                },
+            }),
+            _ => None,
+        };
+
+        Self {
+            networking_manager,
+            context_map: Arc::new(RwLock::new(HashMap::from_iter([(
+                default_context_id,
+                default_context,
+            )]))),
+            epoch_map: Arc::new(RwLock::new(match default_epoch {
+                Some(epoch) => HashMap::from_iter([(*epoch_id, epoch)]),
+                None => HashMap::new(),
+            })),
+            lifecycle: LifecycleCoordinator::default(),
+            verifier: None,
+            rng: Arc::new(Mutex::new(rng)),
+        }
+    }
+
+    // Returns an health check session per context I belong to.
+    async fn get_healthcheck_session_all_contexts(
+        &self,
+    ) -> anyhow::Result<HashMap<ContextId, HealthCheckSession<Role>>> {
+        let mut health_check_sessions = HashMap::new();
+        for (context_id, context) in self.context_map.read().await.iter() {
+            if context.my_role.is_some() {
+                health_check_sessions
+                    .insert(*context_id, self.get_healthcheck_session(context_id).await?);
+            }
+        }
+        Ok(health_check_sessions)
+    }
+
+    async fn get_healthcheck_session(
+        &self,
+        context_id: &ContextId,
+    ) -> anyhow::Result<HealthCheckSession<Role>> {
+        let nm = self.networking_manager.read().await;
+        let role_assignment = self.get_role_assignment(context_id).await?;
+        let my_role = self.my_role(context_id).await?;
+
+        if let Some(role) = my_role {
+            Ok(nm.make_healthcheck_session(&role_assignment, role).await?)
+        } else {
+            Err(anyhow::anyhow!(
+                "My role is not defined for context {}",
+                context_id
+            ))
+        }
+    }
+
+    async fn get_role_assignment(
+        &self,
+        context_id: &ContextId,
+    ) -> anyhow::Result<RoleAssignment<Role>> {
+        let context_map_guard = self.context_map.read().await;
+        let context_info = context_map_guard
+            .get(context_id)
+            .ok_or_else(|| anyhow::anyhow!("Context {} not found in context map", context_id))?;
+        Ok(context_info.role_assignment.clone())
+    }
+
+    pub(crate) fn make_immutable(&self) -> ImmutableSessionMaker {
+        ImmutableSessionMaker {
+            inner: self.clone(),
+        }
+    }
+
+    async fn add_context(
+        &self,
+        context_id: ContextId,
+        my_role: Option<Role>,
+        role_assignment: RoleAssignment<Role>,
+        threshold: u8,
+    ) {
+        let mut context_map = self.context_map.write().await;
+        context_map.insert(
+            context_id,
+            Context {
+                my_role,
+                role_assignment,
+                threshold,
+            },
+        );
+    }
+
+    /// Adds information given by [ContextInfo] struct into the session maker.
+    pub(crate) async fn add_context_info(
+        &self,
+        my_role: Option<Role>,
+        info: &ContextInfo,
+    ) -> anyhow::Result<()> {
+        let mut role_assignment_map = HashMap::new();
+        let mut ca_certs_map = HashMap::new();
+
+        let num_nodes = info.mpc_nodes.len();
+        for node in &info.mpc_nodes {
+            let mpc_url = url::Url::parse(&node.external_url)
+                .map_err(|e| anyhow::anyhow!("url parsing error for party: {}", e))?;
+            let hostname = mpc_url
+                .host_str()
+                .ok_or_else(|| anyhow::anyhow!("missing host"))?;
+            let port = mpc_url
+                .port()
+                .ok_or_else(|| anyhow::anyhow!("missing port"))?;
+            // Defense-in-depth: `indexed_from_one` asserts (panics) on 0. `ContextInfo::verify`
+            // normally validates this first, but guard here so a future caller can't reach it.
+            let party_id = node.party_id as usize;
+            if party_id < 1 || party_id > num_nodes {
+                return Err(anyhow::anyhow!(
+                    "party_id {} out of range 1..={} in context {}",
+                    node.party_id,
+                    num_nodes,
+                    info.context_id()
+                ));
+            }
+            // A duplicate (in-range) party_id would silently overwrite a prior entry, yielding
+            // a role assignment with fewer parties than nodes. verify() rejects duplicates
+            // upstream; reject here too so this stays safe if a caller skips verify().
+            if role_assignment_map
+                .insert(
+                    Role::indexed_from_one(party_id),
+                    Identity::new(hostname.to_string(), port, Some(node.mpc_identity.clone())),
+                )
+                .is_some()
+            {
+                return Err(anyhow::anyhow!(
+                    "duplicate party_id {} in context {}",
+                    node.party_id,
+                    info.context_id()
+                ));
+            }
+
+            if let Some(ca_cert) = &node.ca_cert {
+                let ca_cert = x509_parser::pem::parse_x509_pem(ca_cert)
+                    .map_err(|e| anyhow::anyhow!("x509 parsing error for party: {}", e))?
+                    .1;
+                ca_certs_map.insert(MpcIdentity(node.mpc_identity.clone()), ca_cert);
+            }
+        }
+
+        let role_assignment = RoleAssignment {
+            inner: role_assignment_map,
+        };
+
+        self.add_context(
+            *info.context_id(),
+            my_role,
+            role_assignment,
+            info.threshold as u8,
+        )
+        .await;
+
+        match self.verifier.as_ref() {
+            Some(verifier) => {
+                let context_id_as_session_id = info.context_id().derive_session_id()?;
+                let release_pcrs = if info.pcr_values.is_empty() {
+                    tracing::warn!(
+                        "No PCR values provided for context {}, attested TLS verification may be weakened",
+                        info.context_id()
+                    );
+                    None
+                } else {
+                    Some(info.pcr_values.iter().cloned().collect())
+                };
+                verifier
+                    .add_context(context_id_as_session_id, ca_certs_map, release_pcrs)
+                    .map_err(|e| anyhow::anyhow!("Failed to add context to verifier: {}", e))?;
+            }
+            _ => { /* do nothing */ }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn remove_context(&self, context_id: &ContextId) {
+        let mut context_map = self.context_map.write().await;
+        context_map.remove(context_id);
+    }
+
+    pub(crate) async fn add_epoch(&self, epoch_id: EpochId, epoch_data: EpochData) {
+        let mut epoch_map = self.epoch_map.write().await;
+        epoch_map.insert(epoch_id, epoch_data);
+    }
+
+    pub(crate) async fn remove_epoch(&self, epoch_id: &EpochId) {
+        let mut epoch_map = self.epoch_map.write().await;
+        epoch_map.remove(epoch_id);
+    }
+
+    pub(crate) async fn epoch_exists(&self, epoch_id: &EpochId) -> bool {
+        let epoch_map = self.epoch_map.read().await;
+        epoch_map.contains_key(epoch_id)
+    }
+
+    pub(crate) async fn context_exists(&self, context_id: &ContextId) -> bool {
+        let context_map = self.context_map.read().await;
+        context_map.contains_key(context_id)
+    }
+
+    async fn new_rng(&self) -> AesRng {
+        let mut seed = [0u8; crate::consts::RND_SIZE];
+        // Make a seperate scope for the rng so that it is dropped before the lock is released
+        {
+            let mut base_rng = self.rng.lock().await;
+            base_rng.fill_bytes(seed.as_mut());
+        }
+        AesRng::from_seed(seed)
+    }
+
+    pub(crate) async fn make_base_session(
+        &self,
+        session_id: SessionId,
+        context_id: ContextId,
+        network_mode: NetworkMode,
+    ) -> anyhow::Result<BaseSession> {
+        tracing::info!(
+            "Making base session: session_id={}, context_id={}, network_mode={:?}",
+            session_id,
+            context_id,
+            network_mode
+        );
+        let networking = self
+            .get_networking(session_id, context_id, network_mode)
+            .await;
+
+        let context_map_guard = self.context_map.read().await;
+        let context_info = context_map_guard
+            .get(&context_id)
+            .ok_or_else(|| anyhow::anyhow!("Context {} not found in context map", context_id))?;
+
+        let parameters = SessionParameters::new(
+            context_info.threshold,
+            session_id,
+            context_info.my_role.ok_or_else(|| {
+                anyhow::anyhow!("My role is not defined for context {}", context_id)
+            })?,
+            context_info.role_assignment.keys().cloned().collect(),
+        )?;
+
+        let base_session = BaseSession::new(parameters, networking?, self.new_rng().await)?;
+        Ok(base_session)
+    }
+
+    async fn make_small_async_session_z128(
+        &self,
+        session_id: SessionId,
+        context_id: ContextId,
+        epoch_id: EpochId,
+    ) -> anyhow::Result<SmallSession<ResiduePolyF4Z128>> {
+        self.make_small_session_z128(session_id, context_id, epoch_id, NetworkMode::Async)
+            .await
+    }
+
+    async fn make_small_sync_session_z128(
+        &self,
+        session_id: SessionId,
+        context_id: ContextId,
+        epoch_id: EpochId,
+    ) -> anyhow::Result<SmallSession<ResiduePolyF4Z128>> {
+        self.make_small_session_z128(session_id, context_id, epoch_id, NetworkMode::Sync)
+            .await
+    }
+
+    async fn make_small_async_session_z64(
+        &self,
+        session_id: SessionId,
+        context_id: ContextId,
+        epoch_id: EpochId,
+    ) -> anyhow::Result<SmallSession<ResiduePolyF4Z64>> {
+        self.make_small_session_z64(session_id, context_id, epoch_id, NetworkMode::Async)
+            .await
+    }
+
+    async fn make_small_sync_session_z64(
+        &self,
+        session_id: SessionId,
+        context_id: ContextId,
+        epoch_id: EpochId,
+    ) -> anyhow::Result<SmallSession<ResiduePolyF4Z64>> {
+        self.make_small_session_z64(session_id, context_id, epoch_id, NetworkMode::Sync)
+            .await
+    }
+
+    async fn make_small_session_z128(
+        &self,
+        session_id: SessionId,
+        context_id: ContextId,
+        epoch_id: EpochId,
+        network_mode: NetworkMode,
+    ) -> anyhow::Result<SmallSession<ResiduePolyF4Z128>> {
+        let base_session = self
+            .make_base_session(session_id, context_id, network_mode)
+            .await?;
+
+        let prss_state = {
+            let epoch_map_guard = self.epoch_map.read().await;
+            let prss_setup_extended = epoch_map_guard
+                .get(&epoch_id)
+                .ok_or_else(|| anyhow::anyhow!("Epoch ID {} not found in epoch map", epoch_id))?;
+            let prss_setup = &prss_setup_extended.prss.prss_setup_z128;
+            prss_setup.new_prss_session_state(session_id)
+        };
+
+        let session = SmallSession {
+            base_session,
+            prss_state,
+        };
+        Ok(session)
+    }
+
+    async fn make_small_session_z64(
+        &self,
+        session_id: SessionId,
+        context_id: ContextId,
+        epoch_id: EpochId,
+        network_mode: NetworkMode,
+    ) -> anyhow::Result<SmallSession<ResiduePolyF4Z64>> {
+        let base_session = self
+            .make_base_session(session_id, context_id, network_mode)
+            .await?;
+
+        let prss_state = {
+            let epoch_map_guard = self.epoch_map.read().await;
+            let prss_setup_extended = epoch_map_guard
+                .get(&epoch_id)
+                .ok_or_else(|| anyhow::anyhow!("Epoch ID {} not found in epoch map", epoch_id))?;
+            let prss_setup = &prss_setup_extended.prss.prss_setup_z64;
+
+            prss_setup.new_prss_session_state(session_id)
+        };
+
+        let session = SmallSession {
+            base_session,
+            prss_state,
+        };
+        Ok(session)
+    }
+
+    pub async fn make_two_sets_session(
+        &self,
+        session_id: SessionId,
+        context_id_set1: ContextId,
+        context_id_set2: ContextId,
+        network_mode: NetworkMode,
+    ) -> anyhow::Result<TwoSetsBaseSession> {
+        let (session_params, role_assignment) = self
+            .get_session_params_two_sets(session_id, &context_id_set1, &context_id_set2)
+            .await?;
+
+        let network = self
+            .get_networking_two_sets(
+                session_id,
+                role_assignment,
+                session_params.my_role(),
+                context_id_set1,
+                context_id_set2,
+                network_mode,
+            )
+            .await?;
+
+        TwoSetsBaseSession::new(session_params, network, self.new_rng().await)
+    }
+
+    async fn get_networking(
+        &self,
+        session_id: SessionId,
+        context_id: ContextId,
+        network_mode: NetworkMode,
+    ) -> anyhow::Result<threshold_execution::runtime::sessions::base_session::SingleSetNetworkingImpl>
+    {
+        let nm = self.networking_manager.read().await;
+
+        let (role_assignment, my_role) = {
+            let context_map_guard = self.context_map.read().await;
+            let context_info = context_map_guard.get(&context_id).ok_or_else(|| {
+                anyhow::anyhow!("Context {} not found in context map", context_id)
+            })?;
+            (context_info.role_assignment.clone(), context_info.my_role)
+        };
+
+        if let Some(role) = my_role {
+            let networking = nm
+                .make_network_session(session_id, &role_assignment, role, network_mode)
+                .await?;
+            tracing::debug!(
+                "Getting networking for session_id={}, context_id={:?}, my_role={:?}, network_mode={:?}",
+                session_id,
+                context_id,
+                role,
+                network_mode
+            );
+            Ok(networking)
+        } else {
+            Err(anyhow::anyhow!(
+                "My role is not defined for context {}",
+                context_id
+            ))
+        }
+    }
+
+    async fn get_networking_two_sets(
+        &self,
+        session_id: SessionId,
+        role_assignment: RoleAssignment<TwoSetsRole>,
+        my_role: TwoSetsRole,
+        context_id_set1: ContextId,
+        context_id_set2: ContextId,
+        network_mode: NetworkMode,
+    ) -> anyhow::Result<threshold_execution::runtime::sessions::base_session::TwoSetsNetworkingImpl>
+    {
+        let nm = self.networking_manager.read().await;
+        let networking = nm
+            .make_network_session(session_id, &role_assignment, my_role, network_mode)
+            .await?;
+        tracing::debug!(
+            "Getting networking for session_id={}, context_id_1={:?}, context_id_2={:?}, my_role={:?}, network_mode={:?}",
+            session_id,
+            context_id_set1,
+            context_id_set2,
+            my_role,
+            network_mode
+        );
+        Ok(networking)
+    }
+
+    async fn get_session_params_two_sets(
+        &self,
+        session_id: SessionId,
+        context_id_set1: &ContextId,
+        context_id_set2: &ContextId,
+    ) -> anyhow::Result<(TwoSetsSessionParameters, RoleAssignment<TwoSetsRole>)> {
+        let context_map_guard = self.context_map.read().await;
+        let context_info_s1 = context_map_guard.get(context_id_set1).ok_or_else(|| {
+            anyhow::anyhow!("Context {} not found in context map", context_id_set1)
+        })?;
+        let context_info_s2 = context_map_guard.get(context_id_set2).ok_or_else(|| {
+            anyhow::anyhow!("Context {} not found in context map", context_id_set2)
+        })?;
+
+        let threshold = TwoSetsThreshold {
+            threshold_set_1: context_info_s1.threshold,
+            threshold_set_2: context_info_s2.threshold,
+        };
+
+        let role_assignment_s1 = context_info_s1.role_assignment.clone().inner;
+        let role_assignment_s2 = context_info_s2.role_assignment.clone().inner;
+
+        let my_role_both_sets = match (context_info_s1.my_role, context_info_s2.my_role) {
+            (None, None) => {
+                return Err(anyhow::anyhow!(
+                    "Trying to get parameters for a two sets session, but I am not part of any of the two context {} ,{}",
+                    context_id_set1,
+                    context_id_set2
+                ));
+            }
+            (None, Some(role)) => TwoSetsRole::OnlySet2(role),
+            (Some(role), None) => TwoSetsRole::OnlySet1(role),
+            (Some(role_set_1), Some(role_set_2)) => TwoSetsRole::Both(DualRole {
+                role_set_1,
+                role_set_2,
+            }),
+        };
+
+        // Go over role_assignment_s1 and role_assignment_s2, if one of the value is common to both return
+        // TwoSetsRole::Both, else TwoSetsRole::Set1 or TwoSetsRole::Set2
+        let mut reversed_role_assignment_both_sets = role_assignment_s1
+            .into_iter()
+            .map(|(role, id)| (id, TwoSetsRole::OnlySet1(role)))
+            .collect::<HashMap<_, _>>();
+
+        role_assignment_s2.into_iter().for_each(|(role, id)| {
+            match reversed_role_assignment_both_sets.entry(id) {
+                Entry::Occupied(occupied_entry) => {
+                    let role_set_1 = occupied_entry.into_mut();
+                    match role_set_1 {
+                        TwoSetsRole::OnlySet1(role1) => {
+                            *role_set_1 = TwoSetsRole::Both(DualRole {
+                                role_set_1: *role1,
+                                role_set_2: role,
+                            });
+                        }
+                        _ => {
+                            panic!("Inconsistent state in role assignment for two sets session");
+                        }
+                    }
+                }
+                Entry::Vacant(vacant_entry) => {
+                    let _ = vacant_entry.insert(TwoSetsRole::OnlySet2(role));
+                }
+            }
+        });
+
+        let role_assignment_both_sets = RoleAssignment {
+            inner: reversed_role_assignment_both_sets
+                .into_iter()
+                .map(|(id, role)| (role, id))
+                .collect(),
+        };
+        let session_parameters = TwoSetsSessionParameters::new(
+            threshold,
+            session_id,
+            my_role_both_sets,
+            role_assignment_both_sets.keys().cloned().collect(),
+        )?;
+
+        Ok((session_parameters, role_assignment_both_sets))
+    }
+
+    // If the context does not exist, this returns an error.
+    // If I don't belong to the context, this returns None.
+    pub(crate) async fn my_identity(
+        &self,
+        context_id: &ContextId,
+    ) -> anyhow::Result<Option<Identity>> {
+        let context_map_guard = self.context_map.read().await;
+        let context_info = context_map_guard
+            .get(context_id)
+            .ok_or_else(|| anyhow::anyhow!("Context {} not found in context map", context_id))?;
+
+        Ok(context_info
+            .my_role
+            .and_then(|my_role| context_info.role_assignment.get(&my_role))
+            .cloned())
+    }
+
+    // If the context does not exist, this returns an error.
+    // If I don't belong to the context, this returns None.
+    pub(crate) async fn my_role(&self, context_id: &ContextId) -> anyhow::Result<Option<Role>> {
+        let context_map_guard = self.context_map.read().await;
+        let context_info = context_map_guard
+            .get(context_id)
+            .ok_or_else(|| anyhow::anyhow!("Context {} not found in context map", context_id))?;
+        Ok(context_info.my_role)
+    }
+
+    pub(crate) async fn threshold(&self, context_id: &ContextId) -> anyhow::Result<u8> {
+        let context_map_guard = self.context_map.read().await;
+        let context_info = context_map_guard
+            .get(context_id)
+            .ok_or_else(|| anyhow::anyhow!("Context {} not found in context map", context_id))?;
+        Ok(context_info.threshold)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn num_parties(&self, context_id: &ContextId) -> anyhow::Result<usize> {
+        let context_map_guard = self.context_map.read().await;
+        let context_info = context_map_guard
+            .get(context_id)
+            .ok_or_else(|| anyhow::anyhow!("Context {} not found in context map", context_id))?;
+        Ok(context_info.role_assignment.len())
+    }
+}
+
+/// This is the same as [SessionMaker] but it does not allow mutation of the inner state.
+/// That is, no new contexts or epochs can be added.
+///
+/// Cloning this type is cheap and it is safe to share between threads.
+#[derive(Clone)]
+pub(crate) struct ImmutableSessionMaker {
+    inner: SessionMaker,
+}
+
+impl ImmutableSessionMaker {
+    /// Exclusively reserve a context while its epochs and context metadata are destroyed.
+    pub(crate) async fn try_start_context_destruction(
+        &self,
+        context_id: &ContextId,
+    ) -> Result<ContextDestructionLease, LifecycleConflict> {
+        self.inner
+            .try_get_context_destruction_lease(context_id)
+            .await
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn context_exists(&self, context_id: &ContextId) -> bool {
+        self.inner.context_exists(context_id).await
+    }
+
+    pub(crate) async fn epoch_exists(&self, epoch_id: &EpochId) -> bool {
+        self.inner.epoch_exists(epoch_id).await
+    }
+
+    pub(crate) async fn make_base_session(
+        &self,
+        session_id: SessionId,
+        context_id: ContextId,
+        network_mode: NetworkMode,
+    ) -> anyhow::Result<BaseSession> {
+        self.inner
+            .make_base_session(session_id, context_id, network_mode)
+            .await
+    }
+
+    pub(crate) async fn make_small_async_session_z128(
+        &self,
+        session_id: SessionId,
+        context_id: ContextId,
+        epoch_id: EpochId,
+    ) -> anyhow::Result<SmallSession<ResiduePolyF4Z128>> {
+        self.inner
+            .make_small_async_session_z128(session_id, context_id, epoch_id)
+            .await
+    }
+
+    pub(crate) async fn make_small_async_session_z64(
+        &self,
+        session_id: SessionId,
+        context_id: ContextId,
+        epoch_id: EpochId,
+    ) -> anyhow::Result<SmallSession<ResiduePolyF4Z64>> {
+        self.inner
+            .make_small_async_session_z64(session_id, context_id, epoch_id)
+            .await
+    }
+
+    pub(crate) async fn make_small_sync_session_z128(
+        &self,
+        session_id: SessionId,
+        context_id: ContextId,
+        epoch_id: EpochId,
+    ) -> anyhow::Result<SmallSession<ResiduePolyF4Z128>> {
+        self.inner
+            .make_small_sync_session_z128(session_id, context_id, epoch_id)
+            .await
+    }
+
+    pub(crate) async fn make_small_sync_session_z64(
+        &self,
+        session_id: SessionId,
+        context_id: ContextId,
+        epoch_id: EpochId,
+    ) -> anyhow::Result<SmallSession<ResiduePolyF4Z64>> {
+        self.inner
+            .make_small_sync_session_z64(session_id, context_id, epoch_id)
+            .await
+    }
+
+    pub(crate) async fn make_two_sets_session(
+        &self,
+        session_id: SessionId,
+        context_id_set1: ContextId,
+        context_id_set2: ContextId,
+        network_mode: NetworkMode,
+    ) -> anyhow::Result<TwoSetsBaseSession> {
+        self.inner
+            .make_two_sets_session(session_id, context_id_set1, context_id_set2, network_mode)
+            .await
+    }
+
+    /// If the context doesn't exist or I don't belong to the context,
+    /// return an error .
+    pub(crate) async fn my_identity(&self, context_id: &ContextId) -> anyhow::Result<Identity> {
+        self.inner.my_identity(context_id).await?.ok_or_else(|| {
+            anyhow::anyhow!("My identitify is not defined for context {}", context_id)
+        })
+    }
+
+    /// If the context doesn't exist or I don't belong to the context,
+    /// return an error .
+    pub(crate) async fn my_role(&self, context_id: &ContextId) -> anyhow::Result<Role> {
+        self.inner
+            .my_role(context_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("My role is not defined for context {}", context_id))
+    }
+
+    pub(crate) async fn threshold(&self, context_id: &ContextId) -> anyhow::Result<u8> {
+        self.inner.threshold(context_id).await
+    }
+
+    /// Returns the number of active sessions.
+    pub(crate) async fn active_sessions(&self) -> u64 {
+        self.inner.active_sessions().await
+    }
+
+    /// Returns the number of inactive sessions.
+    pub(crate) async fn inactive_sessions(&self) -> u64 {
+        self.inner.inactive_sessions().await
+    }
+
+    // Returns a health check session per context.
+    pub(crate) async fn get_healthcheck_session_all_contexts(
+        &self,
+    ) -> anyhow::Result<HashMap<ContextId, HealthCheckSession<Role>>> {
+        self.inner.get_healthcheck_session_all_contexts().await
+    }
+
+    // Returns a health check session for the given context.
+    pub(crate) async fn get_healthcheck_session(
+        &self,
+        context_id: &ContextId,
+    ) -> anyhow::Result<HealthCheckSession<Role>> {
+        self.inner.get_healthcheck_session(context_id).await
+    }
+}
+
+/// Validates that a context and epoch ID exists and returns the role of the current server in this context.
+pub(crate) async fn validate_context_and_epoch(
+    op_tag: &'static str,
+    session_maker: &ImmutableSessionMaker,
+    req_id: Option<RequestId>,
+    context_id: &ContextId,
+    epoch_id: &EpochId,
+) -> Result<Role, MetricedError> {
+    // Find the role of the current server and validate the context exists
+    let my_role = session_maker
+        .my_role(context_id)
+        .await
+        .map_err(|e| MetricedError::new(op_tag, req_id, e, Code::NotFound))?;
+
+    if !session_maker.epoch_exists(epoch_id).await {
+        return Err(MetricedError::new(
+            op_tag,
+            req_id,
+            anyhow::anyhow!("Epoch {epoch_id} not found"),
+            Code::NotFound,
+        ));
+    }
+    Ok(my_role)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::threshold::service::epoch_manager::tests::dummy_epoch_data;
+
+    /// Sunshine: `epochs_for_context` returns exactly the epochs whose `EpochData` carries the
+    /// requested context ID, and excludes epochs belonging to other contexts.
+    #[tokio::test]
+    async fn epochs_for_context_filters_by_context() {
+        let mut rng = AesRng::seed_from_u64(1);
+        let session_maker = SessionMaker::empty_dummy_session(AesRng::seed_from_u64(2));
+
+        let context_a = ContextId::new_random(&mut rng);
+        let context_b = ContextId::new_random(&mut rng);
+
+        // Two epochs under context A, one under context B.
+        let epoch_a1 = EpochId::new_random(&mut rng);
+        let epoch_a2 = EpochId::new_random(&mut rng);
+        let epoch_b = EpochId::new_random(&mut rng);
+
+        session_maker
+            .add_epoch(epoch_a1, dummy_epoch_data(context_a))
+            .await;
+        session_maker
+            .add_epoch(epoch_a2, dummy_epoch_data(context_a))
+            .await;
+        session_maker
+            .add_epoch(epoch_b, dummy_epoch_data(context_b))
+            .await;
+
+        let for_a: std::collections::HashSet<EpochId> = session_maker
+            .epochs_for_context(&context_a)
+            .await
+            .into_iter()
+            .collect();
+        let expected: std::collections::HashSet<EpochId> =
+            [epoch_a1, epoch_a2].into_iter().collect();
+        assert_eq!(for_a, expected, "context A must map to exactly its epochs");
+
+        let for_b = session_maker.epochs_for_context(&context_b).await;
+        assert_eq!(
+            for_b,
+            vec![epoch_b],
+            "context B must map to exactly its single epoch"
+        );
+    }
+
+    /// Negative: an unknown context (or one with no epochs) yields an empty result rather than an
+    /// error or spurious epochs.
+    #[tokio::test]
+    async fn epochs_for_context_unknown_context_is_empty() {
+        let mut rng = AesRng::seed_from_u64(3);
+        let session_maker = SessionMaker::empty_dummy_session(AesRng::seed_from_u64(4));
+
+        let known_context = ContextId::new_random(&mut rng);
+        session_maker
+            .add_epoch(
+                EpochId::new_random(&mut rng),
+                dummy_epoch_data(known_context),
+            )
+            .await;
+
+        let unknown_context = ContextId::new_random(&mut rng);
+        assert!(
+            session_maker
+                .epochs_for_context(&unknown_context)
+                .await
+                .is_empty(),
+            "a context with no registered epochs must yield an empty vector"
+        );
+
+        // An entirely empty session maker also returns empty.
+        let empty_session = SessionMaker::empty_dummy_session(AesRng::seed_from_u64(5));
+        assert!(
+            empty_session
+                .epochs_for_context(&known_context)
+                .await
+                .is_empty()
+        );
+    }
+
+    /// An epoch creation is visible to lifecycle coordination before it is registered in
+    /// `epoch_map`, so neither its context nor its epoch can be destroyed in that window.
+    #[tokio::test]
+    async fn epoch_creation_lease_blocks_matching_destruction_only() {
+        let mut rng = AesRng::seed_from_u64(6);
+        let session_maker = SessionMaker::empty_dummy_session(AesRng::seed_from_u64(7));
+        let context_id = ContextId::new_random(&mut rng);
+        let epoch_id = EpochId::new_random(&mut rng);
+        let endpoint_session_maker = session_maker.make_immutable();
+
+        let creation = session_maker
+            .try_get_epoch_creation_lease(&context_id, &epoch_id)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            endpoint_session_maker
+                .try_start_context_destruction(&context_id)
+                .await
+                .unwrap_err(),
+            LifecycleConflict::Context(context_id)
+        );
+        assert_eq!(
+            session_maker
+                .try_get_epoch_destruction_lease(&epoch_id)
+                .await
+                .unwrap_err(),
+            LifecycleConflict::Epoch(epoch_id)
+        );
+
+        // Unrelated lifecycle operations remain independent.
+        let other_context_id = ContextId::new_random(&mut rng);
+        let other_epoch_id = EpochId::new_random(&mut rng);
+        endpoint_session_maker
+            .try_start_context_destruction(&other_context_id)
+            .await
+            .unwrap();
+        session_maker
+            .try_get_epoch_destruction_lease(&other_epoch_id)
+            .await
+            .unwrap();
+
+        drop(creation);
+        endpoint_session_maker
+            .try_start_context_destruction(&context_id)
+            .await
+            .unwrap();
+        session_maker
+            .try_get_epoch_destruction_lease(&epoch_id)
+            .await
+            .unwrap();
+    }
+
+    /// Whichever destructive operation acquires its exclusive lease first prevents a conflicting
+    /// epoch creation from beginning until that lease is released.
+    #[tokio::test]
+    async fn destruction_leases_block_epoch_creation_until_drop() {
+        let mut rng = AesRng::seed_from_u64(8);
+        let session_maker = SessionMaker::empty_dummy_session(AesRng::seed_from_u64(9));
+        let context_id = ContextId::new_random(&mut rng);
+        let epoch_id = EpochId::new_random(&mut rng);
+
+        let context_destruction = session_maker
+            .try_get_context_destruction_lease(&context_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            session_maker
+                .try_get_epoch_creation_lease(&context_id, &epoch_id)
+                .await
+                .unwrap_err(),
+            LifecycleConflict::Context(context_id)
+        );
+        drop(context_destruction);
+
+        let epoch_destruction = session_maker
+            .try_get_epoch_destruction_lease(&epoch_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            session_maker
+                .try_get_epoch_creation_lease(&context_id, &epoch_id)
+                .await
+                .unwrap_err(),
+            LifecycleConflict::Epoch(epoch_id)
+        );
+        drop(epoch_destruction);
+
+        session_maker
+            .try_get_epoch_creation_lease(&context_id, &epoch_id)
+            .await
+            .unwrap();
+    }
+}

@@ -1,0 +1,60 @@
+name: Setup Rust and Protoc
+description: Reusable setup for Rust toolchain and Protobuf compiler
+
+inputs:
+  setup-rust:
+    description: Whether to install the Rust toolchain
+    required: false
+    default: "true"
+  rust-toolchain:
+    description: Rust toolchain version or channel
+    required: false
+    default: stable
+  rust-components:
+    description: Optional comma-separated Rust components
+    required: false
+    default: ""
+  rust-cache:
+    description: Enable cache in setup-rust-toolchain
+    required: false
+    default: "false"
+  setup-protoc:
+    description: Whether to install Protoc
+    required: false
+    default: "true"
+  setup-cargo-nextest:
+    description: Whether to install cargo-nextest
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Rust
+      if: ${{ inputs.setup-rust == 'true' }}
+      uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1.15.2
+      with:
+        toolchain: ${{ inputs.rust-toolchain }}
+        components: ${{ inputs.rust-components }}
+        cache: ${{ inputs.rust-cache }}
+
+    - name: Install Protoc
+      if: ${{ inputs.setup-protoc == 'true' }}
+      env:
+        PROTOC_VERSION: "34.1"
+        PROTOC_SHA256: af27ea66cd26938fe48587804ca7d4817457a08350021a1c6e23a27ccc8c6904
+      shell: bash
+      run: |
+        echo "$PATH"
+        set -euo pipefail
+        PROTOC_ARCHIVE="protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+        curl -LO "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/${PROTOC_ARCHIVE}"
+        echo "${PROTOC_SHA256}  ${PROTOC_ARCHIVE}" | sha256sum --check --strict
+        mkdir -p "${HOME}/.local"
+        unzip -o "${PROTOC_ARCHIVE}" -d "${HOME}/.local"
+        protoc --version
+
+    - name: Install cargo-nextest
+      if: ${{ inputs.setup-cargo-nextest == 'true' }}
+      shell: bash
+      run: cargo install cargo-nextest@0.9.133 --locked --force

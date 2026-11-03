@@ -1,0 +1,163 @@
+name: docker-scan
+on:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  check-changes:
+    name: docker-scan/check-changes
+    # job permissions
+    permissions:
+      actions: read # Required to read workflow run information
+      contents: read # Required to checkout repository code
+      id-token: write # Required for OIDC token generation
+      pull-requests: read # Required to read pull request information
+    runs-on: ubuntu-latest
+    outputs:
+      # Each output indicates if files in a specific component were modified
+      changed-dockerfile: ${{ steps.filter.outputs.dockerfile_files }}
+      changed: ${{ steps.filter.outputs.dockerfile }}
+    steps:
+      # TODO: remove once GitHub runner images ship the CVE-2026-31431 kernel fix
+      - name: Workaround CVE-2026-31431 (copy.fail)
+        run: |
+          echo "install algif_aead /bin/false" | sudo tee /etc/modprobe.d/disable-algif-aead.conf
+          if lsmod | grep -q algif_aead; then
+            sudo rmmod algif_aead || echo "WARNING: rmmod failed - module may be in use"
+          elif modinfo algif_aead 2>/dev/null | grep -q builtin; then
+            echo "WARNING: algif_aead built-in - modprobe.d blacklist has no effect"
+          fi
+
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: true
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        id: filter
+        with:
+          # Define paths that trigger specific component workflows
+          # Changes to observability affect multiple components
+          list-files: 'json'
+          filters: |
+            dockerfile:
+              - 'docker/**/Dockerfile'
+
+  scan-and-comment:
+    name: docker-scan/scan-and-comment
+    permissions:
+      issues: write # Required to create comments on issues
+      pull-requests: write # Required to create comments on pull requests
+      packages: read # Required to read GitHub packages/container registry
+    runs-on: ubuntu-latest
+    needs: check-changes
+    if: needs.check-changes.outputs.changed == 'true'
+    strategy:
+      matrix:
+        dockerfile: ${{fromJson(needs.check-changes.outputs.changed-dockerfile)}}
+    steps:
+      # TODO: remove once GitHub runner images ship the CVE-2026-31431 kernel fix
+      - name: Workaround CVE-2026-31431 (copy.fail)
+        run: |
+          echo "install algif_aead /bin/false" | sudo tee /etc/modprobe.d/disable-algif-aead.conf
+          if lsmod | grep -q algif_aead; then
+            sudo rmmod algif_aead || echo "WARNING: rmmod failed - module may be in use"
+          elif modinfo algif_aead 2>/dev/null | grep -q builtin; then
+            echo "WARNING: algif_aead built-in - modprobe.d blacklist has no effect"
+          fi
+
+      - name: Checkout code
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          submodules: true
+          token: ${{ secrets.BLOCKCHAIN_ACTIONS_TOKEN }}
+          persist-credentials: false
+
+      - name: Get Rust version
+        env:
+          GH_WORKSPACE: ${{ github.workspace }}
+        run: |
+          version="$(grep 'channel' "$GH_WORKSPACE/rust-toolchain.toml" | awk -F' = ' '{print $2}' | tr -d '"')"
+          echo "RUST_IMAGE_VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: ./.github/actions/docker-setup-buildx
+        with:
+          platforms: linux/amd64
+
+      - name: Login to GitHub Container Registry
+        uses: ./.github/actions/docker-login
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Chainguard Container Registry
+        uses: ./.github/actions/docker-login
+        with:
+          registry: cgr.dev
+          username: ${{ secrets.CGR_USERNAME }}
+          password: ${{ secrets.CGR_PASSWORD }}
+
+      - name: Docker Build and Push with Platform Tag
+        id: build
+        uses: ./.github/actions/docker-build-push
+        env:
+          RUNS_ON_S3_BUCKET_CACHE: gh-actions-cache-eu-west-3
+          RUNS_ON_AWS_REGION: eu-west-3
+        with:
+          build-args: |
+            RUST_IMAGE_VERSION=${{ env.RUST_IMAGE_VERSION }}
+            LTO_RELEASE=release-lto-thin
+            TARGETARCH=amd64
+            SCCACHE_BUCKET=${{ env.RUNS_ON_S3_BUCKET_CACHE }}
+            SCCACHE_REGION=${{ env.RUNS_ON_AWS_REGION }}
+            SCCACHE_S3_PREFIX=sccache/${{ github.repository }}/docker-scan/amd64
+          context: '.'
+          # Secret IDs MUST match what the Dockerfiles `--mount=type=secret,id=…`
+          # expects (lowercase). Mismatched names = silently missing files in
+          # /run/secrets and sccache fails to authenticate to S3.
+          secrets: |
+            BLOCKCHAIN_ACTIONS_TOKEN=${{ secrets.BLOCKCHAIN_ACTIONS_TOKEN }}
+            sccache_aws_access_key_id=${{ secrets.AWS_ACCESS_KEY_S3_USER }}
+            sccache_aws_secret_access_key=${{ secrets.AWS_SECRET_KEY_S3_USER }}
+            CGR_USERNAME=${{ secrets.CGR_USERNAME }}
+            CGR_PASSWORD=${{ secrets.CGR_PASSWORD }}
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64
+          push: false
+          pull: false
+          load: true
+          provenance: false
+          sbom: false
+          target: prod
+          tags: |
+            base:latest
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@57a97c7e7821a5776cebc9bb87c984fa69cba8f1 # v0.35.0
+        with:
+          image-ref: base:latest
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          output: trivy-result.txt
+
+      - name: Check Trivy result file
+        run: cat trivy-result.txt
+
+      - name: Format Trivy Scan Result
+        run: |
+          if [ -s trivy-result.txt ]; then
+            echo -e "## Vulnerability Scan Results\n<details><summary>Details</summary>\n\n\`\`\`\n$(cat trivy-result.txt)\n\`\`\`\n</details>" > formatted-trivy-result.md
+          else
+            echo -e "## Vulnerability Scan Results\nNo vulnerabilities were detected." > formatted-trivy-result.md
+          fi
+
+      - name: Comment PR with Trivy scan results
+        uses: marocchino/sticky-pull-request-comment@773744901bac0e8cbb5a0dc842800d45e9b2b405 # v2.9.4
+        env:
+          GITHUB_TOKEN: ${{ secrets.BLOCKCHAIN_ACTIONS_TOKEN }}
+        with:
+          path: formatted-trivy-result.md
+
+      - name: Clean up Trivy result file
+        run: rm -f trivy-result.txt formatted-trivy-result.md

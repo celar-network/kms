@@ -1,0 +1,711 @@
+use aes_prng::AesRng;
+use alloy_sol_types::Eip712Domain;
+use anyhow::Result;
+use kms_grpc::kms::v1::{CrsGenRequest, CrsGenResult, Empty};
+use kms_grpc::{EpochId, RequestId};
+use observability::metrics::METRICS;
+use observability::metrics_names::{
+    CENTRAL_TAG, OP_CRS_GEN_ABORT, OP_CRS_GEN_REQUEST, OP_CRS_GEN_RESULT,
+    OP_INSECURE_CRS_GEN_REQUEST, TAG_PARTY_ID,
+};
+use std::sync::Arc;
+use threshold_execution::tfhe_internals::parameters::DKGParams;
+use tokio_util::sync::CancellationToken;
+
+use tokio::sync::RwLock;
+use tonic::{Request, Response};
+use tracing::Instrument;
+
+use crate::cryptography::signatures::PrivateSigKey;
+use crate::cryptography::signing::SigningSchemeType;
+use crate::engine::base::{CrsGenMetadata, stored_scheme_signatures_to_proto};
+use crate::engine::centralized::central_kms::{CentralizedKms, async_generate_crs};
+use crate::engine::traits::{BackupOperator, ContextManager};
+use crate::engine::utils::MetricedError;
+use crate::engine::validation::{
+    RequestIdParsingErr, parse_grpc_request_id, validate_crs_gen_request,
+};
+use crate::util::meta_store::{
+    MetaStore, MetaStorePermit, add_req_to_meta_store, retrieve_from_meta_store,
+    update_err_req_in_meta_store,
+};
+use crate::vault::storage::crypto_material::CentralizedCryptoMaterialStorage;
+use crate::vault::storage::{Storage, StorageExt};
+
+/// Implementation of the crs_gen endpoint
+pub async fn crs_gen_impl<
+    PubS: Storage + Sync + Send + 'static,
+    PrivS: StorageExt + Sync + Send + 'static,
+    CM: ContextManager + Sync + Send + 'static,
+    BO: BackupOperator + Sync + Send + 'static,
+>(
+    service: &CentralizedKms<PubS, PrivS, CM, BO>,
+    request: Request<CrsGenRequest>,
+    insecure: bool,
+) -> Result<Response<Empty>, MetricedError> {
+    tracing::info!("Received CRS generation request");
+    // Retrieve the correct tag
+    let op_tag = if insecure {
+        OP_INSECURE_CRS_GEN_REQUEST
+    } else {
+        OP_CRS_GEN_REQUEST
+    };
+
+    let permit = service.rate_limiter.start_crsgen(op_tag).await?;
+    let timer = METRICS
+        .time_operation(op_tag)
+        .tag(TAG_PARTY_ID, CENTRAL_TAG.to_string())
+        .start();
+    let inner = request.into_inner();
+    let max_bits = inner.max_num_bits;
+    let verified = validate_crs_gen_request(inner, op_tag)?;
+
+    if !service
+        .context_manager
+        .mpc_context_exists_in_cache(&verified.context_id)
+        .await
+    {
+        return Err(MetricedError::new(
+            op_tag,
+            Some(verified.req_id),
+            anyhow::anyhow!("context at ID {} not found", verified.context_id),
+            tonic::Code::NotFound,
+        ));
+    }
+
+    let meta_store = Arc::clone(&service.crs_meta_map);
+    let crypto_storage = service.crypto_storage.clone();
+    let sk = service
+            .base_kms
+            .sig_key()
+            .map_err(|e| {
+        MetricedError::new(
+            op_tag,
+            Some(verified.req_id),
+            anyhow::anyhow!("Signing key is not present. This should only happen when server is booted in recovery mode: {}", e),
+            tonic::Code::FailedPrecondition,
+        )
+    })?;
+    // check that the request ID is not used yet
+    // and then insert the request ID only if it's unused
+    // all validation must be done before inserting the request ID.
+    let meta_permit =
+        add_req_to_meta_store(&service.crs_meta_map, &verified.req_id, op_tag).await?;
+    let rng = service.base_kms.new_rng().await;
+
+    let req_id = verified.req_id;
+    let epoch_id = verified.epoch_id;
+    let token = CancellationToken::new();
+    {
+        service
+            .ongoing_crs_gen
+            .lock()
+            .await
+            .insert(req_id, token.clone());
+    }
+    let ongoing = Arc::clone(&service.ongoing_crs_gen);
+
+    service.tracker.spawn(
+        async move {
+            let _timer = timer;
+            let _permit = permit;
+            crs_gen_background(
+                meta_permit,
+                token,
+                &req_id,
+                &epoch_id,
+                rng,
+                meta_store,
+                crypto_storage,
+                sk,
+                verified.params,
+                verified.eip712_domain,
+                verified.extra_data,
+                verified.signing_schemes,
+                max_bits,
+                op_tag,
+            )
+            .await;
+            ongoing.lock().await.remove(&req_id);
+        }
+        .instrument(tracing::Span::current()),
+    );
+    Ok(Response::new(Empty {}))
+}
+
+/// Implementation of the get_crs_gen_result endpoint
+pub async fn get_crs_gen_result_impl<
+    PubS: Storage + Sync + Send + 'static,
+    PrivS: StorageExt + Sync + Send + 'static,
+    CM: ContextManager + Sync + Send + 'static,
+    BO: BackupOperator + Sync + Send + 'static,
+>(
+    service: &CentralizedKms<PubS, PrivS, CM, BO>,
+    request: Request<kms_grpc::kms::v1::RequestId>,
+    insecure: bool,
+) -> Result<Response<CrsGenResult>, MetricedError> {
+    // Retrieve the correct tag
+    let op_tag = if insecure {
+        OP_INSECURE_CRS_GEN_REQUEST
+    } else {
+        OP_CRS_GEN_RESULT
+    };
+    let request_id =
+        parse_grpc_request_id(&request.into_inner(), RequestIdParsingErr::CrsGenResponse)
+            .map_err(|e| MetricedError::new(op_tag, None, e, tonic::Code::InvalidArgument))?;
+    tracing::debug!("Received CRS gen result request with id {}", request_id);
+
+    let crs_info = retrieve_from_meta_store(&service.crs_meta_map, &request_id, op_tag).await?;
+
+    match crs_info.as_ref() {
+        CrsGenMetadata::LegacyV0(_) => {
+            // This is a legacy result, we cannot return the crs_digest or external_signature
+            // as they're signed using a different SolStruct and hashed using a different domain separator
+            tracing::warn!(
+                "Received a legacy CRS generation result,
+                not returning crs_digest or external_signature"
+            );
+            // The old SignedPubDataHandleInternal does not store max_num_bits
+            // so we have to read it from storage if we want to return it.
+            // But because this is a legacy result and the call path will not reach here
+            // (because a restart is needed to upgrade to the new version and the meta store is deleted from RAM)
+            // it is never needed, so we just return 0 for max_num_bits.
+            Ok(Response::new(CrsGenResult {
+                request_id: Some(request_id.into()),
+                crs_digest: vec![],
+                max_num_bits: 0,
+                external_signature: vec![],
+                signatures: vec![],
+            }))
+        }
+        CrsGenMetadata::Current(crs_info) => {
+            if request_id != crs_info.crs_id {
+                return Err(MetricedError::new(
+                    op_tag,
+                    Some(request_id),
+                    anyhow::anyhow!(
+                        "Request ID mismatch: expected {request_id}, got {}",
+                        crs_info.crs_id
+                    ),
+                    tonic::Code::Internal,
+                ));
+            }
+
+            Ok(Response::new(CrsGenResult {
+                request_id: Some(request_id.into()),
+                crs_digest: crs_info.crs_digest.clone(),
+                max_num_bits: crs_info.max_num_bits,
+                external_signature: crs_info.external_signature.clone(),
+                signatures: stored_scheme_signatures_to_proto(&crs_info.signatures),
+            }))
+        }
+    }
+}
+
+pub async fn abort_crs_gen_impl<
+    PubS: Storage + Sync + Send + 'static,
+    PrivS: StorageExt + Sync + Send + 'static,
+    CM: ContextManager + Sync + Send + 'static,
+    BO: BackupOperator + Sync + Send + 'static,
+>(
+    service: &CentralizedKms<PubS, PrivS, CM, BO>,
+    request: Request<kms_grpc::kms::v1::RequestId>,
+) -> Result<Response<Empty>, MetricedError> {
+    let request_id = parse_grpc_request_id(&request.into_inner(), RequestIdParsingErr::CrsGenAbort)
+        .map_err(|e| MetricedError::new(OP_CRS_GEN_ABORT, None, e, tonic::Code::InvalidArgument))?;
+    match service.ongoing_crs_gen.lock().await.remove(&request_id) {
+        Some(cancellation_token) => {
+            // Observe that the cancellation arm handles the abortion and clean-up
+            cancellation_token.cancel();
+            tracing::info!("Aborted CRS generation with request ID {}", request_id);
+            Ok(Response::new(Empty {}))
+        }
+        None => {
+            // No CRS generation happening; nothing to cancel
+            Err(MetricedError::new(
+                OP_CRS_GEN_ABORT,
+                Some(request_id),
+                anyhow::anyhow!("No ongoing CRS generation found for the supplied request ID"),
+                tonic::Code::NotFound,
+            ))
+        }
+    }
+}
+
+/// Background task for CRS generation
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn crs_gen_background<
+    PubS: Storage + Send + Sync + 'static,
+    PrivS: StorageExt + Send + Sync + 'static,
+>(
+    permit: MetaStorePermit<CrsGenMetadata>,
+    cancel_token: CancellationToken,
+    req_id: &RequestId,
+    epoch_id: &EpochId,
+    rng: AesRng,
+    meta_store: Arc<RwLock<MetaStore<CrsGenMetadata>>>,
+    crypto_storage: CentralizedCryptoMaterialStorage<PubS, PrivS>,
+    sk: Arc<PrivateSigKey>,
+    params: DKGParams,
+    eip712_domain: Eip712Domain,
+    extra_data: Vec<u8>,
+    signing_schemes: Vec<SigningSchemeType>,
+    max_number_bits: Option<u32>,
+    op_tag: &'static str,
+) {
+    let start = tokio::time::Instant::now();
+
+    let outcome: Result<(tfhe::zk::CompactPkeCrs, CrsGenMetadata), String> = tokio::select! {
+        biased;
+        () = cancel_token.cancelled() => Err(format!("CRS generation aborted for request {req_id}")),
+        result = async_generate_crs(
+            &sk, &signing_schemes, params, max_number_bits, eip712_domain, extra_data, req_id, rng,
+        ) => result.map_err(|e| e.to_string()),
+    };
+
+    match outcome {
+        Err(msg) => {
+            tracing::error!("{msg}");
+            let del_res = crypto_storage
+                .inner
+                .purge_crs_material(req_id, epoch_id)
+                .await;
+            let msg = if del_res {
+                let m = format!(
+                    "CRS generation aborted and CRS material deleted successfully for request {req_id}"
+                );
+                tracing::info!(m);
+                m
+            } else {
+                let m = format!(
+                    "CRS generation aborted but failed to delete CRS material for request {req_id}"
+                );
+                tracing::error!(m);
+                m
+            };
+
+            let _ = update_err_req_in_meta_store(&meta_store, permit, msg, op_tag).await;
+        }
+        Ok((pp, crs_info)) => {
+            if let Err(e) = crypto_storage
+                .inner
+                .write_crs(req_id, epoch_id, pp, crs_info, meta_store, permit, op_tag)
+                .await
+            {
+                tracing::error!("Failed to write CRS to storage: {e}");
+                return;
+            }
+            tracing::info!(
+                "⏱️ Core Event Time for CRS-gen request id {}: {:?}",
+                req_id,
+                start.elapsed()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kms_grpc::{kms::v1::FheParameter, rpc_types::alloy_to_protobuf_domain};
+    use rand::SeedableRng;
+
+    use crate::{
+        consts::DEFAULT_EPOCH_ID,
+        dummy_domain,
+        engine::{base::derive_request_id, centralized::service::tests::setup_central_test_kms},
+        testing::utils::poll_result_until_ready,
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn sunshine() {
+        let mut rng = AesRng::seed_from_u64(1234);
+        let (kms, _) = setup_central_test_kms(&mut rng).await;
+        let req_id = derive_request_id("test_crs_gen_sunshine").unwrap();
+        let epoch_id = derive_request_id("test_crs_gen_sunshine_epoch").unwrap();
+        let domain = alloy_to_protobuf_domain(&dummy_domain()).unwrap();
+        let request = CrsGenRequest {
+            signing_schemes: vec![kms_grpc::kms::v1::SigningSchemeType::Ecdsa256k1 as i32],
+            request_id: Some(req_id.into()),
+            epoch_id: Some(epoch_id.into()),
+            context_id: None,
+            params: FheParameter::Test.into(),
+            domain: Some(domain.clone()),
+            extra_data: vec![],
+            max_num_bits: Some(2048),
+        };
+        let _res = crs_gen_impl(&kms, Request::new(request), true)
+            .await
+            .unwrap();
+        // The result endpoint is non-blocking; poll until the background CRS gen completes.
+        let _ = crate::testing::utils::poll_result_until_ready(|| {
+            get_crs_gen_result_impl(&kms, Request::new(req_id.into()), false)
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn already_exists() {
+        let mut rng = AesRng::seed_from_u64(1234);
+        let (kms, _) = setup_central_test_kms(&mut rng).await;
+        let req_id = derive_request_id("test_crs_gen_already_exists").unwrap();
+        let epoch_id = derive_request_id("test_crs_gen_already_exists_epoch").unwrap();
+        let domain = alloy_to_protobuf_domain(&dummy_domain()).unwrap();
+        let request = CrsGenRequest {
+            signing_schemes: vec![kms_grpc::kms::v1::SigningSchemeType::Ecdsa256k1 as i32],
+            request_id: Some(req_id.into()),
+            epoch_id: Some(epoch_id.into()),
+            context_id: None,
+            params: FheParameter::Test.into(),
+            domain: Some(domain.clone()),
+            extra_data: vec![],
+            max_num_bits: Some(2048),
+        };
+        let _res = crs_gen_impl(&kms, Request::new(request.clone()), false)
+            .await
+            .unwrap();
+        let err = crs_gen_impl(&kms, Request::new(request), true)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::AlreadyExists);
+    }
+
+    #[tokio::test]
+    async fn invalid_argument() {
+        let mut rng = AesRng::seed_from_u64(1234);
+        let (kms, _) = setup_central_test_kms(&mut rng).await;
+        let req_id = derive_request_id("test_crs_gen_invalid_argument").unwrap();
+        let epoch_id = derive_request_id("test_crs_gen_invalid_argument_epoch").unwrap();
+        let domain = alloy_to_protobuf_domain(&dummy_domain()).unwrap();
+
+        // wrong params
+        {
+            let request = CrsGenRequest {
+                signing_schemes: vec![kms_grpc::kms::v1::SigningSchemeType::Ecdsa256k1 as i32],
+                request_id: Some(req_id.into()),
+                epoch_id: Some(epoch_id.into()),
+                context_id: None,
+                params: 123, // invalid params
+                domain: Some(domain.clone()),
+                extra_data: vec![],
+                max_num_bits: None,
+            };
+            let err = crs_gen_impl(&kms, Request::new(request), false)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }
+
+        // missing request ID
+        {
+            let request = CrsGenRequest {
+                signing_schemes: vec![kms_grpc::kms::v1::SigningSchemeType::Ecdsa256k1 as i32],
+                request_id: None, // missing
+                epoch_id: Some(epoch_id.into()),
+                context_id: None,
+                params: FheParameter::Test.into(),
+                domain: Some(domain.clone()),
+                extra_data: vec![],
+                max_num_bits: None,
+            };
+            let err = crs_gen_impl(&kms, Request::new(request), false)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }
+
+        // wrong request ID format
+        {
+            let request = CrsGenRequest {
+                signing_schemes: vec![kms_grpc::kms::v1::SigningSchemeType::Ecdsa256k1 as i32],
+                request_id: Some(kms_grpc::kms::v1::RequestId {
+                    request_id: "not_a_valid_request_id".to_string(),
+                }),
+                epoch_id: Some(epoch_id.into()),
+                context_id: None,
+                params: FheParameter::Test.into(),
+                domain: Some(domain.clone()),
+                extra_data: vec![],
+                max_num_bits: None,
+            };
+            let err = crs_gen_impl(&kms, Request::new(request), false)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }
+
+        // missing domain
+        {
+            let request = CrsGenRequest {
+                signing_schemes: vec![kms_grpc::kms::v1::SigningSchemeType::Ecdsa256k1 as i32],
+                request_id: Some(req_id.into()),
+                epoch_id: Some(epoch_id.into()),
+                context_id: None,
+                params: FheParameter::Test.into(),
+                domain: None, // missing
+                extra_data: vec![],
+                max_num_bits: None,
+            };
+            let err = crs_gen_impl(&kms, Request::new(request), false)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }
+
+        // invalid context ID
+        {
+            let request = CrsGenRequest {
+                signing_schemes: vec![kms_grpc::kms::v1::SigningSchemeType::Ecdsa256k1 as i32],
+                request_id: Some(req_id.into()),
+                epoch_id: Some(epoch_id.into()),
+                context_id: Some(kms_grpc::kms::v1::RequestId {
+                    request_id: "not_a_valid_context_id".to_string(),
+                }),
+                params: FheParameter::Test.into(),
+                domain: Some(domain.clone()),
+                extra_data: vec![],
+                max_num_bits: None,
+            };
+            let err = crs_gen_impl(&kms, Request::new(request), false)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }
+
+        // invalid max_num_bits
+        {
+            let request = CrsGenRequest {
+                signing_schemes: vec![kms_grpc::kms::v1::SigningSchemeType::Ecdsa256k1 as i32],
+                request_id: Some(req_id.into()),
+                epoch_id: Some(epoch_id.into()),
+                context_id: None,
+                params: FheParameter::Test.into(),
+                domain: Some(domain.clone()),
+                extra_data: vec![],
+                max_num_bits: Some(123), // invalid
+            };
+            let err = crs_gen_impl(&kms, Request::new(request), false)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }
+
+        // invalid epoch ID format
+        {
+            let request = CrsGenRequest {
+                signing_schemes: vec![],
+                request_id: Some(req_id.into()),
+                epoch_id: Some(kms_grpc::kms::v1::RequestId {
+                    request_id: "not_a_valid_epoch_id".to_string(),
+                }),
+                context_id: None,
+                params: FheParameter::Test.into(),
+                domain: Some(domain.clone()),
+                extra_data: vec![],
+                max_num_bits: None,
+            };
+            let err = crs_gen_impl(&kms, Request::new(request), false)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }
+
+        // TODO: re-enable the following tests after the default epoch fallback is removed in validation
+        // https://github.com/zama-ai/kms-internal/issues/2758
+        //
+        // // missing epoch ID
+        // {
+        //     let request = CrsGenRequest {
+        //         request_id: Some(req_id.into()),
+        //         epoch_id: None, // missing
+        //         context_id: None,
+        //         params: FheParameter::Test.into(),
+        //         domain: Some(domain),
+        //         extra_data: vec![],
+        //         max_num_bits: None,
+        //     };
+        //     let err = crs_gen_impl(&kms, Request::new(request), false)
+        //         .await
+        //         .unwrap_err();
+        //     assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        // }
+    }
+
+    // test the missing epoch ID case that is currently allowed with a warning, to make sure the default epoch fallback works, and to prepare for the future removal of the default epoch fallback
+    // TODO: remove following tests after the default epoch fallback is no longer used in validation
+    // https://github.com/zama-ai/kms-internal/issues/2758
+    #[tokio::test]
+    async fn default_epoch_id() {
+        let mut rng = AesRng::seed_from_u64(54321);
+        let (kms, _) = setup_central_test_kms(&mut rng).await;
+        let req_id = derive_request_id("test_crs_gen_default_epoch").unwrap();
+        let domain = alloy_to_protobuf_domain(&dummy_domain()).unwrap();
+
+        // missing epoch ID should use default epoch with a warning, but not fail
+        {
+            let request = CrsGenRequest {
+                signing_schemes: vec![kms_grpc::kms::v1::SigningSchemeType::Ecdsa256k1 as i32],
+                request_id: Some(req_id.into()),
+                epoch_id: None, // missing
+                context_id: None,
+                params: FheParameter::Test.into(),
+                domain: Some(domain),
+                extra_data: vec![],
+                max_num_bits: None,
+            };
+            let _req = crs_gen_impl(&kms, Request::new(request), false)
+                .await
+                .unwrap();
+            let res = crate::testing::utils::poll_result_until_ready(|| {
+                get_crs_gen_result_impl(&kms, Request::new(req_id.into()), false)
+            })
+            .await
+            .unwrap();
+
+            assert_eq!(
+                res.into_inner()
+                    .request_id
+                    .unwrap()
+                    .request_id
+                    .to_ascii_lowercase(),
+                req_id.as_str()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn not_found() {
+        let mut rng = AesRng::seed_from_u64(1234);
+        let (kms, _) = setup_central_test_kms(&mut rng).await;
+        let bad_req_id = derive_request_id("test_crs_gen_not_found").unwrap();
+        let get_result =
+            get_crs_gen_result_impl(&kms, Request::new(bad_req_id.into()), false).await;
+        assert_eq!(get_result.unwrap_err().code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn resource_exhausted() {
+        let mut rng = AesRng::seed_from_u64(1234);
+        let (mut kms, _) = setup_central_test_kms(&mut rng).await;
+        kms.set_bucket_size(1); // set bucket size to 1 to trigger resource exhausted error
+        let req_id = derive_request_id("test_crs_gen_resource_exhausted").unwrap();
+        let epoch_id = derive_request_id("test_crs_gen_resource_exhausted_epoch").unwrap();
+        let domain = alloy_to_protobuf_domain(&dummy_domain()).unwrap();
+
+        let request = CrsGenRequest {
+            signing_schemes: vec![kms_grpc::kms::v1::SigningSchemeType::Ecdsa256k1 as i32],
+            request_id: Some(req_id.into()),
+            epoch_id: Some(epoch_id.into()),
+            context_id: None,
+            params: FheParameter::Test.into(),
+            domain: Some(domain),
+            extra_data: vec![],
+            max_num_bits: None,
+        };
+        let err = crs_gen_impl(&kms, Request::new(request), false)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn abort_not_found() {
+        let mut rng = AesRng::seed_from_u64(1234);
+        let (kms, _) = setup_central_test_kms(&mut rng).await;
+        let req_id = derive_request_id("test_crs_gen_abort_not_found").unwrap();
+        let err = abort_crs_gen_impl(&kms, Request::new(req_id.into()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn abort_during_crs_gen() {
+        let mut rng = AesRng::seed_from_u64(1234);
+        let (kms, _) = setup_central_test_kms(&mut rng).await;
+        let req_id = derive_request_id("abort_during_crs_gen_crs_id").unwrap();
+        let domain = alloy_to_protobuf_domain(&dummy_domain()).unwrap();
+        let request = CrsGenRequest {
+            signing_schemes: vec![kms_grpc::kms::v1::SigningSchemeType::Ecdsa256k1 as i32],
+            request_id: Some(req_id.into()),
+            epoch_id: Some((*DEFAULT_EPOCH_ID).into()), // use default epoch to make sure the test works even if the default epoch fallback is removed in validation
+            context_id: None,
+            params: FheParameter::Test.into(),
+            domain: Some(domain),
+            extra_data: vec![],
+            max_num_bits: Some(2048),
+        };
+        crs_gen_impl(&kms, Request::new(request), false)
+            .await
+            .unwrap();
+
+        // Abort before the background task finishes. The cancellation token is
+        // inserted synchronously inside `crs_gen_impl` before it returns, so the
+        // abort is guaranteed to find it. Generation with max_num_bits=2048 takes
+        // long enough that the cancel arm wins the `tokio::select!` race.
+        abort_crs_gen_impl(&kms, Request::new(req_id.into()))
+            .await
+            .unwrap();
+
+        // Second abort fails because the cancellation token has already been consumed.
+        let err = abort_crs_gen_impl(&kms, Request::new(req_id.into()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+
+        // The cancellation arm updates the meta store with an "aborted" error message,
+        // so retrieving the result returns Aborted (the meta store maps "abort" error
+        // messages to tonic::Code::Aborted).
+        let err = poll_result_until_ready(|| {
+            get_crs_gen_result_impl(&kms, Request::new(req_id.into()), false)
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Aborted);
+    }
+
+    #[tokio::test]
+    async fn abort_already_finished() {
+        let mut rng = AesRng::seed_from_u64(1234);
+        let (kms, _) = setup_central_test_kms(&mut rng).await;
+        let req_id = derive_request_id("test_crs_gen_abort_already_finished").unwrap();
+        let epoch_id = derive_request_id("test_crs_gen_abort_already_finished_epoch").unwrap();
+        let domain = alloy_to_protobuf_domain(&dummy_domain()).unwrap();
+        let request = CrsGenRequest {
+            signing_schemes: vec![kms_grpc::kms::v1::SigningSchemeType::Ecdsa256k1 as i32],
+            request_id: Some(req_id.into()),
+            epoch_id: Some(epoch_id.into()),
+            context_id: None,
+            params: FheParameter::Test.into(),
+            domain: Some(domain),
+            extra_data: vec![],
+            max_num_bits: Some(2048),
+        };
+        crs_gen_impl(&kms, Request::new(request), false)
+            .await
+            .unwrap();
+        // Poll until CRS generation completes so the meta store entry is set
+        // (the result endpoint is non-blocking).
+        let _ = poll_result_until_ready(|| {
+            get_crs_gen_result_impl(&kms, Request::new(req_id.into()), false)
+        })
+        .await
+        .unwrap();
+
+        // Wait for the background task to remove the cancellation token after completion.
+        // The meta store is updated before the token removal, so poll until the ongoing map is empty.
+        for _ in 0..100 {
+            if !kms.ongoing_crs_gen.lock().await.contains_key(&req_id) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let err = abort_crs_gen_impl(&kms, Request::new(req_id.into()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+}

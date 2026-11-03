@@ -1,0 +1,380 @@
+# Configuration for the KMS peers
+# This is used to define the number of peers and their IDs
+kmsPeers:
+  # Defines either the peer ID when count=1 or the start ID of a set of peers when count>1
+  # id: 1
+  # The number of peers managed by the StatefulSets
+  count: 1
+
+kmsCore:
+  # Add the following to enable the core:
+  enabled: true
+  # Static Prometheus const-labels added to every KMS metric, as a `key=value,key=value` list
+  # (e.g. "deployment_profile=kind-ci"), to distinguish deployments. Empty = none. Sets KMS_METRICS_LABELS.
+  metricsLabels: ""
+  # Override the name of the core:
+  nameOverride:
+  # Override the address of the core:
+  addressOverride:
+  # Override the image of the core:
+  image:
+    # For enclave deployment: hub.zama.org/ghcr/zama-ai/kms/core-service-enclave
+    # For non-enclave deployment: hub.zama.org/ghcr/zama-ai/kms/core-service
+    name: hub.zama.org/ghcr/zama-ai/kms/core-service
+    tag: latest
+    pullPolicy: Always
+  # Define the service account name for the core:
+  serviceAccountName:
+  # Define the environment variables for the core:
+  # This is used to load environment variables from a configmap
+  envFrom:
+    configmap:
+      name: mpc-party
+      key:
+        coreClientS3Endpoint: CORE_CLIENT__S3_ENDPOINT
+        thresholdId: KMS_CORE__THRESHOLD__MY_ID
+        privateVaultStorageBucket: KMS_CORE__PRIVATE_VAULT__STORAGE__S3__BUCKET
+        privateVaultStoragePrefix: KMS_CORE__PRIVATE_VAULT__STORAGE__S3__PREFIX
+        privateVaultKeychainAWSKMSRootKeySpec: KMS_CORE__PRIVATE_VAULT__KEYCHAIN__AWS_KMS__ROOT_KEY_SPEC
+        privateVaultKeychainAWSKMSRootKeyID: KMS_CORE__PRIVATE_VAULT__KEYCHAIN__AWS_KMS__ROOT_KEY_ID
+        publicVaultStorageBucket: KMS_CORE__PUBLIC_VAULT__STORAGE__S3__BUCKET
+        publicVaultStoragePrefix: KMS_CORE__PUBLIC_VAULT__STORAGE__S3__PREFIX
+        backupVaultStorageBucket: KMS_CORE__BACKUP_VAULT__STORAGE__S3__BUCKET
+        backupVaultStoragePrefix: KMS_CORE__BACKUP_VAULT__STORAGE__S3__PREFIX
+        backupVaultKeychainAWSKMSRootKeySpec: KMS_CORE__BACKUP_VAULT__KEYCHAIN__AWS_KMS__ROOT_KEY_SPEC
+        backupVaultKeychainAWSKMSRootKeyID: KMS_CORE__BACKUP_VAULT__KEYCHAIN__AWS_KMS__ROOT_KEY_ID
+  rateLimiter:
+    bucketSize: 50000
+  # One-time migration input associating existing epochs with the context they belong to.
+  # Consumed once by the epoch-data migration on startup; idempotent, so it can be left in place.
+  # Each epoch belongs to exactly one context, so a given epoch ID must appear under a single entry.
+  # IDs are hex strings (with or without a `0x` prefix).
+  # Only to be used in 0.15.x and removed in 0.16.x or above.
+  migration:
+    contextAssociations: []
+    # Example:
+    #  - contextId: "0x0700000000000000000000000000000000000000000000000000000000000001" # Default Context ID
+    #    epochIds:
+    #      - "0x0800000000000000000000000000000000000000000000000000000000000001" # Default Epoch ID
+    #      - "0x0800000000000000000000000000000000000000000000000000000000000002" # ID of the first new epoch created
+  # Add the following to enable threshold mode:
+  thresholdMode:
+    enabled: false
+    # If left unset, the chart will generate the list automatically based on pod replicas of the statefulset
+    peersList: []
+    #  - id: 1
+    #    host: kms-core-1
+    #    port: 50001
+    #    ca_certificate:
+    #      pem: |
+    #        -----BEGIN CERTIFICATE-----
+    #        -----END CERTIFICATE-----
+    #  - id: 2
+    #    host: kms-core-2
+    #    port: 50001
+    #    ca_certificate:
+    #      pem: |
+    #        -----BEGIN CERTIFICATE-----
+    #        -----END CERTIFICATE-----
+
+    # If enabled, the core will communicate with other cores over TLS
+    tls:
+      enabled: false
+      # Core TLS certificates and keys can be loaded from file paths or from PEM
+      # blocks NB: only PEM blocks are can be used to provide certificates to
+      # Nitro enclaves!
+      # ca_certificate:
+        # You have to define either `path` or `pem`
+        # Certificate: path to the certificate file
+        # path:
+        # Certificate: PEM block
+        # pem:
+        #   -----BEGIN CERTIFICATE-----
+        #   -----END CERTIFICATE-----
+      # Nitro enclaves will ignore this value since they generate their own
+      # attested ephemeral keypairs
+      # privateKey:
+      #   path: /my/very/secret/key.pem
+      # If set, the enclave-enabled core will only establish TLS connections
+      # with peers that have attested PCR0,1,2 values from this list
+      trustedReleases:
+        - pcr0: "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+          pcr1: "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+          pcr2: "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+      # Enables mutual attestation of private vault root key policies
+      attestPrivateVaultRootKey: false
+    # This value appears in the config file as `threshold`.
+    multiplier: 2.0
+    maxInterval: 60
+    maxElapsedTime: 300
+    networkTimeout: 300
+    initialIntervalMs: 100
+    maxOpenedInactiveSessionsPerParty: 1000
+    enableSysMetrics: true
+    refreshIntervalMs: 5000
+    tokioWorkerThreads: 10
+    rayonNumThreads: 40
+    # Threshold value is the number of corruptions that the protocol handles.
+    # 1 for 4 parties, 4 for 13 parties
+    thresholdValue: 4
+    decCapacity: 10000
+    minDecCache: 6000
+    # Number of sessions to pre-process should be equal to number of vCPUs
+    numSessionsPreproc: 100
+    decryptionMode: "NoiseFloodSmall"
+  # Add the following to enable nitro enclave:
+  # Nitro enclave needs specific instance types
+  nitroEnclave:
+    enabled: false
+    signed: false
+    # Enclave bootstrap support sockets.
+    webIdentityTokenPort: 4100
+    # Enclave CPU count, must be a multiple of 2 since whole cores (not hyperthreads) are sliced off and dedicated to the enclave
+    cpuCount: 48
+    # Enclave Memory in GiB
+    memoryGiB: 96
+    networkTunnel:
+      enabled: true
+      # If unset, queueCount defaults to a heuristic based on the threshold
+      # party topology: 8 queues minimum, or the next power of two above the
+      # hot peer-flow count (2 * (party_count - 1)) in threshold mode.
+      queueCount:
+      # If unset, tokioWorkerThreads defaults to a smaller scheduler pool than
+      # queueCount: 4 workers for up to 16 queues, otherwise 8 workers.
+      tokioWorkerThreads:
+      # interfaceName is local to the parent-side network namespace, so it does
+      # not need to match the enclave-side TUN_IF constant. The address values
+      # are served to the enclave by the parent-side vsocktun bootstrap over the
+      # fixed tunnel VSOCK port used by the deployment scripts.
+      interfaceName: vsocktun
+      subnet: 10.118.0.0/24
+      parentAddress: 10.118.0.1/24
+      # Served to the enclave by parent-side vsocktun during bootstrap.
+      # This must include the CIDR prefix expected by `vsocktun --enclave-address`.
+      enclaveAddress: 10.118.0.2/24
+      # Parent-side resource limits
+      resources:
+        requests:
+          memory: 256Mi
+          cpu: 8
+        limits:
+          memory: 1024Mi
+          cpu: 16
+    cid: 20
+    eifPath: /app/kms/core/service/enclave.eif
+    eifSignKey: 00000000-0000-0000-0000-000000000000
+    userId: 10003
+    groupId: 10002
+  publicVault:
+    s3:
+      enabled: true
+      bucket: kms-public
+      prefix: ""
+  privateVault:
+    s3:
+      enabled: false
+      bucket: kms-private
+      prefix: ""
+    awskms:
+      enabled: false
+      rootKeyId: 00000000-0000-0000-0000-000000000000
+      rootKeySpec: symm
+  #########################################################
+  # BACKUP VAULT CONFIGURATION
+  #########################################################
+  # For the backup we can only set one backup method:
+  # - AWS BACKUP: S3 + AWS KMS
+  # - Custodian backup: custodianBackup=true, backupVault=S3 ONLY
+  #
+  custodianBackup: false
+  backupVault:
+    s3:
+      enabled: false
+      bucket: kms-private-backup
+      prefix: ""
+    awskms:
+      enabled: false
+      rootKeyId: 00000000-0000-0000-0000-000000000000
+      rootKeySpec: symm
+  #########################################################
+  aws:
+    roleArn:
+    region: eu-west-1
+  storage:
+    # storageClassName: gp3
+    capacity: 5Gi
+  ports:
+    client: 50100
+    peer: 50001
+    metrics: 9646
+  readinessProbe:
+    failureThreshold: 30
+    initialDelaySeconds: 10
+    periodSeconds: 5
+  startupProbe:
+    failureThreshold: 10
+    initialDelaySeconds: 30
+    periodSeconds: 10
+  livenessProbe:
+    failureThreshold: 10
+    initialDelaySeconds: 10
+    timeoutSeconds: 5
+  workdir: /root
+  serviceMonitor:
+    enabled: false
+    # Optional prefix added to every scraped metric name via metricRelabelings
+    # (e.g. "ci_"). Empty means no renaming. Used to namespace CI metrics so a
+    # central Prometheus can keep them separate from production series.
+    metricNamePrefix: ""
+  # Note: these requests/limits is only for non-enclave workloads, this will not be allocated to the kms-core process running in Nitro
+  resources:
+    requests: {}
+      # memory: 1Gi
+      # cpu: 1
+    limits:
+      # memory: 30Gi
+      ephemeralStorage: 1Gi
+      grpcTimeout: 360
+      # 100MB
+      grpcMaxMessageSize: 104857600
+  nodeSelector:
+  affinity:
+  tolerations:
+mtls:
+  enabled: false
+
+kmsCoreClient:
+  enabled: false
+  nameOverride:
+  image:
+    name: hub.zama.org/ghcr/zama-ai/kms/core-client
+    tag: latest
+  envFrom:
+    configmap:
+      name:
+      privateVaultStorageKey:
+      publicVaultStorageKey:
+  num_majority: 5
+  num_reconstruct: 9
+  decryption_mode: NoiseFloodSmall
+  fhe_parameter: Default
+  resources:
+    requests: {}
+      # memory: 1Gi
+      # cpu: 1
+    limits: {}
+      # memory: 30Gi
+      # cpu: 1
+  nodeSelector:
+  affinity:
+  tolerations:
+
+# Threshold Init job
+kmsInit:
+  enabled: false
+  timeoutSeconds: 1200
+  nameOverride:
+  nodeSelector:
+  affinity:
+  tolerations:
+
+kmsGenCertAndKeys:
+  enabled: false
+  nameOverride:
+
+# Automatic Key Generation job
+kmsGenKeys:
+  enabled: false
+  nameOverride:
+  # command line arguments passed to kms-core-client
+  keyGenArgs: "insecure-key-gen"
+  crsGenArgs: "insecure-crs-gen --max-num-bits 1024"
+  configmap:
+    name: kms-keys
+    annotations:
+  resources: {}
+
+# Used by kms-gen-keys job
+kubectl:
+  image:
+    name: hub.zama.org/zama-protocol/zama.ai/kubectl
+    tag: v1.36-dev
+    pullPolicy: Always
+
+# Used by kms-threshold-init job
+grpcHeathProbe:
+  image:
+    name: hub.zama.org/zama-protocol/zama.ai/grpc-health-probe
+    tag: v0.4-dev
+    pullPolicy: Always
+
+# Used by enclave proxy sidecars
+socat:
+  image:
+    name: hub.zama.org/zama-protocol/zama.ai/socat
+    tag: v1.8-dev
+    pullPolicy: Always
+
+runMode: dev
+
+tracing:
+  enabled: false
+  endpoint: "http://otel-deployment-opentelemetry-collector.observability.svc.cluster.local:4317"
+  otlp_timeout_ms: 10000
+
+
+# Minio: If we want to use local s3 storage, we can use Minio
+# i.e: by deploying Minio operator: https://docs.min.io/community/minio-object-store/operations/deployments/k8s-deploy-operator-helm-on-kubernetes.html?ref=github
+# or Minio chart community maintained: https://github.com/minio/minio/tree/master/helm/minio
+#
+minio:
+  enabled: false
+  # If enabled, the minio endpoint will be used to store the keys. Example: http://minio:9000
+  endpoint:
+  # If enabled, the minio username will be used to store the keys
+  username:
+  # If enabled, the minio password will be used to store the keys
+  password:
+
+rustLog: info
+
+# Add pod annotations to the kms-core
+# podAnnotations:
+#   configmap.reloader.stakater.com/auto: "true"
+
+podSecurityContext:
+  # To set when the image will support non root user
+  runAsUser: 10002
+  runAsGroup: 10003
+  fsGroup: 10003
+  runAsNonRoot: true
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  privileged: false
+
+podSecurityContextForEnclave:
+  fsGroup: 1001     # Keep this as 1001 to match device group
+  supplementalGroups: [1001]  # Add device group as supplemental
+
+kyverno:
+  enabled: false
+
+# Cronjob kubernetes
+kmsCoreClientTesting:
+  enabled: false
+  nameOverride: ""
+  schedule: "*/5 * * * *"
+  resources:
+    requests: {}
+      # memory: 1Gi
+      # cpu: 1
+    limits: {}
+      # memory: 30Gi
+      # cpu: 1
+  shell_command:
+  storage:
+    storageClassName: gp3
+    capacity: 5Gi

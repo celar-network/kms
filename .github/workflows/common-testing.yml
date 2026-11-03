@@ -1,0 +1,295 @@
+name: common-testing
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+      runner-volume:
+        type: string
+        required: false
+        default: '200gb'
+      rust-log-level:
+        type: string
+        required: false
+        default: 'error'
+      args-tests:
+        type: string
+        required: false
+        default: ''
+      crate-names:
+        # A list of packages forwarded to cargo, e.g. `-p abc -p def -p ghi`.
+        # Injected verbatim into cargo invocations that need explicit package
+        # scoping (`cargo clippy`, `cargo nextest`).
+        type: string
+        required: true
+      skip-test-material:
+        # When true, skip test-material generation and the kms-custodian
+        # build. Useful for light unit-test-only jobs on crates that don't
+        # need integration test fixtures.
+        type: boolean
+        required: false
+        default: false
+      efs-test-material-path:
+        # Optional absolute path to pre-generated test material on EFS.
+        # Example: /mnt/efs/kms-test-material/<generator-hash>/insecure_secure_4_13
+        # (the hash keys the generator inputs; the leaf dir names the material
+        # set). When provided, this workflow links ./test-material to that path.
+        type: string
+        required: false
+        default: ''
+      lfs:
+        # When true, pull LFS objects on checkout. Only `-p kms`
+        # backward_compatibility_*.rs tests need them (~24MB).
+        type: boolean
+        required: false
+        default: false
+      nextest-profile:
+        type: string
+        required: false
+        default: 'ci'  # Use 'ci-nightly' for nightly builds that run all tests
+      nextest-test-threads:
+        type: string
+        required: false
+        default: ''  # Empty = use nextest's default (~ num-CPUs).
+    secrets:
+      GHCR_READ_TOKEN:
+        required: true
+      SLACK_CHANNEL:
+        required: true
+      BOT_USERNAME:
+        required: true
+      SLACK_WEBHOOK:
+        required: true
+      CGR_USERNAME:
+        required: true
+      CGR_PASSWORD:
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+  DOCKER_BUILD_TEST_CORE_CLIENT: 1
+  CARGO_INCREMENTAL: 0
+  DOCKER_BUILDKIT: 1
+
+# No top-level permissions needed - job-level permissions are more specific
+permissions: {}
+
+jobs:
+  compile-rust-unit-tests:
+    name: common-testing/compile-rust-unit-tests
+    permissions:
+      checks: write # Required to create GitHub checks for test results
+      packages: read # Required to read GitHub packages/container registry
+      issues: write # Required to create comments on issues
+      pull-requests: write # Required to create comments on pull requests
+      actions: read # Required to read workflow run information and download artifacts
+      contents: read # Required to checkout repository code
+    timeout-minutes: 500
+    runs-on: runs-on=${{ github.run_id }}/runner=${{ inputs.runs-on }}/spot=false/volume=${{ inputs.runner-volume }}/extras=s3-cache+efs
+
+    steps:
+      - name: Setup Runs-on
+        uses: runs-on/action@cd2b598b0515d39d78c38a02d529db87d2196d1e # v2.0.3
+        with:
+          metrics: cpu,network,memory,disk,io
+
+      - name: Checkout Project
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          lfs: ${{ inputs.lfs }}
+          persist-credentials: false
+
+      - name: Get Rust version
+        env:
+          GH_WORKSPACE: ${{ github.workspace }}
+        run: |
+          version="$(grep 'channel' "$GH_WORKSPACE/rust-toolchain.toml" | awk -F' = ' '{print $2}' | tr -d '"')"
+          echo "RUST_IMAGE_VERSION=$version" >> "$GITHUB_ENV"
+
+      # Needed to be able to pull some docker images for the simulator test
+      - name: Login to GitHub Container Registry
+        uses: ./.github/actions/docker-login
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Chainguard Container Registry
+        uses: ./.github/actions/docker-login
+        with:
+          registry: cgr.dev
+          username: ${{ secrets.CGR_USERNAME }}
+          password: ${{ secrets.CGR_PASSWORD }}
+
+      ############################################################################
+      # Rust toolchain setup
+      #
+      - name: Set up Rust and Protoc
+        uses: ./.github/actions/setup-rust-and-protoc
+        with:
+          rust-toolchain: ${{ env.RUST_IMAGE_VERSION }}
+          rust-components: llvm-tools-preview, llvm-tools
+          rust-cache: "false"
+          setup-cargo-nextest: "true"
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        with:
+          # Share cache across jobs/workflows that build the same dependency set.
+          shared-key: kms-rust
+          # Save on main and on internal (non-fork) PRs so PR branches get a
+          # warm cache; forks can't write to the cache anyway.
+          save-if: ${{ github.ref == 'refs/heads/main' || github.event.pull_request.head.repo.fork == false }}
+
+      # Fallback when no EFS path is supplied (e.g. the nightly caller in
+      # main.yml): the job still needs fixtures, so generate the full
+      # insecure+secure set for parties 4,13 locally into ./test-material
+      # rather than silently running material-dependent tests with none.
+      - name: Generate test material locally (no EFS path provided)
+        if: ${{ ! inputs.skip-test-material && inputs.efs-test-material-path == '' }}
+        run: |
+          echo "::warning::efs-test-material-path not provided; generating test material locally."
+          rm -rf ./test-material
+          # Build the generator in Cargo's built-in `test` profile so the test
+          # jobs can reuse more compiled artifacts from the rust cache.
+          echo "EXECUTING: cargo run --profile test -p generate-test-material -- --output ./test-material --verbose --profile insecure,secure --parties 4,13"
+          cargo run --profile test -p generate-test-material -- --output ./test-material --verbose --profile insecure,secure --parties 4,13
+          du -sh ./test-material || true
+
+      - name: Link pre-generated test material from EFS
+        if: ${{ ! inputs.skip-test-material && inputs.efs-test-material-path != '' }}
+        env:
+          EFS_TEST_MATERIAL_PATH: ${{ inputs.efs-test-material-path }}
+        run: |
+          if [ ! -d "${EFS_TEST_MATERIAL_PATH}" ]; then
+            echo "::error::EFS test material path does not exist: ${EFS_TEST_MATERIAL_PATH}"
+            exit 1
+          fi
+
+          rm -rf ./test-material
+          ln -s "${EFS_TEST_MATERIAL_PATH}" ./test-material
+          echo "Linked ./test-material -> ${EFS_TEST_MATERIAL_PATH}"
+          du -shL ./test-material || true
+
+      # Test execution
+      # Integration tests use pre-generated test material and native KMS servers (no Docker)
+      - name: Run Tests
+        id: tests
+        env:
+          CRATE_NAMES: ${{ inputs.crate-names }}
+          ARGS_TESTS: ${{inputs.args-tests}}
+          NEXTEST_PROFILE: ${{ inputs.nextest-profile }}
+          NEXTEST_TEST_THREADS_INPUT: ${{ inputs.nextest-test-threads }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUST_LOG: ${{ inputs.rust-log-level }}
+        run: |
+          # Build the env-var prefix for the nextest invocation so the printed
+          # `EXECUTING:` line below is exactly what gets run (no implicit
+          # exported state). Copy-paste the echoed command and it reproduces CI.
+          CMD_ENV="RUST_BACKTRACE=full"
+
+          if [ -n "${NEXTEST_TEST_THREADS_INPUT}" ]; then
+            CMD_ENV="${CMD_ENV} NEXTEST_TEST_THREADS=${NEXTEST_TEST_THREADS_INPUT}"
+            echo "NEXTEST_TEST_THREADS set to: ${NEXTEST_TEST_THREADS_INPUT}"
+          else
+            echo "NEXTEST_TEST_THREADS not set (using nextest default)"
+          fi
+
+          mkdir -p ~/.aws/ &&
+          echo "[default]" > ~/.aws/credentials &&
+          echo "aws_access_key_id = ${AWS_ACCESS_KEY_ID}" >> ~/.aws/credentials &&
+          echo "aws_secret_access_key = ${AWS_SECRET_ACCESS_KEY}" >> ~/.aws/credentials &&
+          cat ~/.aws/credentials &&
+          echo "[default]" > ~/.aws/config &&
+          echo "output=json" >> ~/.aws/config &&
+          echo "region=${AWS_DEFAULT_REGION}" >> ~/.aws/config &&
+          echo "endpoint_url=${AWS_ENDPOINT}" >> ~/.aws/config &&
+          cat ~/.aws/config
+          # Intentional word-splitting on CMD_ENV, CRATE_NAMES, and ARGS_TESTS.
+          # shellcheck disable=SC2086
+          echo "EXECUTING: env ${CMD_ENV} cargo nextest run --profile ${NEXTEST_PROFILE} --no-fail-fast ${CRATE_NAMES} ${ARGS_TESTS:+$ARGS_TESTS}"
+          # shellcheck disable=SC2086
+          env ${CMD_ENV} cargo nextest run --profile "${NEXTEST_PROFILE}" --no-fail-fast ${CRATE_NAMES} ${ARGS_TESTS:+$ARGS_TESTS}
+
+      - name: Copy Test Results
+        if: (!cancelled() || !failure() && github.event_name == 'pull_request')
+        env:
+          NEXTEST_PROFILE: ${{ inputs.nextest-profile }}
+        run: |
+          NEXTEST_OUT="${GITHUB_WORKSPACE}/target/nextest/${NEXTEST_PROFILE}"
+          if find "${NEXTEST_OUT}" -mindepth 1 -type f -print -quit 2>/dev/null | grep -q .; then
+            echo "Files found in ${NEXTEST_OUT}"
+            ls -R "${NEXTEST_OUT}"
+            echo "TIMESTAMP=$(date +"%Y%m%d%H%M%S%3N")" >> "$GITHUB_ENV"
+            cp -Lpr "${NEXTEST_OUT}"/junit.xml /tmp/junit.xml # zizmor: ignore[template-injection]
+            echo "EXIT_CODE=0" >> "$GITHUB_ENV"
+          else
+            echo "No junit test files found in ${NEXTEST_OUT}"
+            echo "EXIT_CODE=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+        shell: bash
+
+      - name: Upload Test Results
+        if: ((!cancelled() || !failure() && github.event_name == 'pull_request') && env.EXIT_CODE == 0)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: junit-test-report-${{ env.TIMESTAMP }}
+          path: /tmp/junit.xml
+
+      - name: Set Slack color
+        id: slack_color
+        env:
+          JOB_RESULT: ${{ steps.tests.outcome }}
+        run: |
+          if [ "${JOB_RESULT}" = "success" ]; then
+            echo "color=good" >> "$GITHUB_OUTPUT"
+          else
+            echo "color=danger" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post nightly tests results in a channel
+        if: always() && github.event_name == 'schedule'
+        uses: rtCamp/action-slack-notify@e31e87e03dd19038e411e38ae27cbad084a90661 # v2.3.3
+        env:
+          ACTION_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
+          SLACK_USERNAME: ${{ secrets.BOT_USERNAME }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACK_ICON_EMOJI: ':github-octocat:'
+          SLACK_TITLE: 'Nightly Tests Result'
+          SLACK_COLOR: ${{ steps.slack_color.outputs.color }}
+          SLACK_MESSAGE: "${{ steps.tests.outcome }} \nFor args: ${{ inputs.args-tests }}"
+
+      - name: Generate unique ID
+        if: always()
+        id: unique-id
+        run: echo "id=$(date "+%s%N" | md5sum | head -c 8)" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      # `package-name` holds cargo flags like `-p kms` or `-p a -p b -p c`.
+      # Strip the `-p` tokens and join remaining crate names with `_` so the
+      # artifact label stays readable (e.g. `kms`, `a_b_c`).
+      - name: Compute logs label
+        if: always()
+        id: logs-label
+        env:
+          CRATE_NAMES: ${{ inputs.crate-names }}
+        shell: bash
+        run: echo "value=$(echo "${CRATE_NAMES}" | sed -E 's/-p +//g' | tr ' ' '_')" >> "$GITHUB_OUTPUT"
+
+      - name: Archive integration test trace logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: logs-${{ steps.logs-label.outputs.value }}-${{ github.workflow }}-${{ github.run_number }}-${{ github.job }}-${{ steps.unique-id.outputs.id }}
+          path: '**/*.log'
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Remove aws credentials file
+        run: |
+          rm -rf ~/.aws

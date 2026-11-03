@@ -1,0 +1,264 @@
+use crate::conf::BandwidthBenchmarkConfig;
+use crate::engine::Shutdown;
+use crate::engine::threshold::bandwidth_bench::new_bandwidth_bench_limiter;
+use crate::engine::threshold::service::session::ImmutableSessionMaker;
+use crate::retry_loop;
+use kms_grpc::kms_service::v1::core_service_endpoint_server::CoreServiceEndpointServer;
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
+use tokio_util::task::TaskTracker;
+use tonic_health::server::HealthReporter;
+
+pub struct ThresholdKms<
+    EP: Sync,
+    UD: Sync,
+    PD: Sync,
+    KG: Sync,
+    #[cfg(feature = "insecure")] IKG: Sync,
+    PP: Sync,
+    CG: Sync,
+    #[cfg(feature = "insecure")] ICG: Sync,
+    CM: Sync,
+    BO: Sync,
+> {
+    pub(crate) epoch_manager: EP,
+    pub(crate) user_decryptor: UD,
+    pub(crate) decryptor: PD,
+    pub(crate) key_generator: KG,
+    #[cfg(feature = "insecure")]
+    pub(crate) insecure_key_generator: IKG,
+    pub(crate) keygen_preprocessor: PP,
+    pub(crate) crs_generator: CG,
+    #[cfg(feature = "insecure")]
+    pub(crate) insecure_crs_generator: ICG,
+    pub(crate) context_manager: CM,
+    pub(crate) backup_operator: BO,
+    pub(crate) session_maker: ImmutableSessionMaker,
+    /// Bounds concurrent `bandwidth_benchmark` runs (the endpoint takes no rate-limiter permit).
+    pub(crate) bandwidth_bench_limiter: Arc<Semaphore>,
+    /// Caller-input bounds enforced by the `bandwidth_benchmark` endpoint.
+    pub(crate) bandwidth_bench_config: BandwidthBenchmarkConfig,
+    tracker: Arc<TaskTracker>,
+    health_reporter: HealthReporter,
+    mpc_abort_handle: JoinHandle<Result<(), anyhow::Error>>,
+}
+
+#[cfg(feature = "insecure")]
+impl<
+    EP: Sync,
+    UD: Sync,
+    PD: Sync,
+    KG: Sync,
+    IKG: Sync,
+    PP: Sync,
+    CG: Sync,
+    ICG: Sync,
+    CM: Sync,
+    BO: Sync,
+> ThresholdKms<EP, UD, PD, KG, IKG, PP, CG, ICG, CM, BO>
+{
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        epoch_manager: EP,
+        user_decryptor: UD,
+        decryptor: PD,
+        key_generator: KG,
+        insecure_key_generator: IKG,
+        keygen_preprocessor: PP,
+        crs_generator: CG,
+        insecure_crs_generator: ICG,
+        context_manager: CM,
+        backup_operator: BO,
+        tracker: Arc<TaskTracker>,
+        session_maker: ImmutableSessionMaker,
+        bandwidth_bench_config: BandwidthBenchmarkConfig,
+        health_reporter: HealthReporter,
+        mpc_abort_handle: JoinHandle<Result<(), anyhow::Error>>,
+    ) -> Self {
+        Self {
+            epoch_manager,
+            user_decryptor,
+            decryptor,
+            key_generator,
+            insecure_key_generator,
+            keygen_preprocessor,
+            crs_generator,
+            insecure_crs_generator,
+            context_manager,
+            backup_operator,
+            tracker,
+            session_maker,
+            bandwidth_bench_limiter: new_bandwidth_bench_limiter(
+                bandwidth_bench_config.max_concurrent_runs,
+            ),
+            bandwidth_bench_config,
+            health_reporter,
+            mpc_abort_handle,
+        }
+    }
+}
+
+#[cfg(feature = "insecure")]
+#[tonic::async_trait]
+impl<
+    EP: Sync,
+    UD: Sync,
+    PD: Sync,
+    KG: Sync,
+    IKG: Sync,
+    PP: Sync,
+    CG: Sync,
+    ICG: Sync,
+    CM: Sync,
+    BO: Sync,
+> Shutdown for ThresholdKms<EP, UD, PD, KG, IKG, PP, CG, ICG, CM, BO>
+{
+    fn shutdown(&self) -> anyhow::Result<JoinHandle<()>> {
+        let health_reporter = self.health_reporter.clone();
+        let tracker = Arc::clone(&self.tracker);
+        let mpc_abort_handle = self.mpc_abort_handle.abort_handle();
+        let handle = {
+            let new_handle_clone = mpc_abort_handle.clone();
+            tokio::task::spawn(async move {
+                health_reporter
+                    .set_not_serving::<CoreServiceEndpointServer<Self>>()
+                    .await;
+                tracing::trace!("Set not serving");
+                tracker.close();
+                tracker.wait().await;
+                mpc_abort_handle.abort();
+                let res: anyhow::Result<()> = retry_loop!(
+                    || {
+                        let new_handle_clone = new_handle_clone.clone();
+                        async move {
+                            if !new_handle_clone.is_finished() {
+                                return Err(anyhow::anyhow!("MPC server not done"));
+                            }
+                            Ok(())
+                        }
+                    },
+                    100,
+                    200
+                );
+                if let Err(e) = res {
+                    tracing::error!("Error waiting for MPC server to finish: {:?}", e);
+                }
+                tracing::info!("Threshold Core service endpoint server shutdown complete.");
+            })
+        };
+        Ok(handle)
+    }
+}
+
+#[cfg(feature = "insecure")]
+impl<
+    EP: Sync,
+    UD: Sync,
+    PD: Sync,
+    KG: Sync,
+    IKG: Sync,
+    PP: Sync,
+    CG: Sync,
+    ICG: Sync,
+    CM: Sync,
+    BO: Sync,
+> Drop for ThresholdKms<EP, UD, PD, KG, IKG, PP, CG, ICG, CM, BO>
+{
+    fn drop(&mut self) {
+        // Start the shutdown and let it finish in the background
+        let _ = self.shutdown();
+    }
+}
+
+#[cfg(not(feature = "insecure"))]
+impl<EP: Sync, UD: Sync, PD: Sync, KG: Sync, PP: Sync, CG: Sync, CM: Sync, BO: Sync>
+    ThresholdKms<EP, UD, PD, KG, PP, CG, CM, BO>
+{
+    #[expect(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        epoch_manager: EP,
+        user_decryptor: UD,
+        decryptor: PD,
+        key_generator: KG,
+        keygen_preprocessor: PP,
+        crs_generator: CG,
+        context_manager: CM,
+        backup_operator: BO,
+        tracker: Arc<TaskTracker>,
+        session_maker: ImmutableSessionMaker,
+        bandwidth_bench_config: BandwidthBenchmarkConfig,
+        health_reporter: HealthReporter,
+        mpc_abort_handle: JoinHandle<Result<(), anyhow::Error>>,
+    ) -> Self {
+        Self {
+            epoch_manager,
+            user_decryptor,
+            decryptor,
+            key_generator,
+            keygen_preprocessor,
+            crs_generator,
+            context_manager,
+            backup_operator,
+            tracker,
+            session_maker,
+            bandwidth_bench_limiter: new_bandwidth_bench_limiter(
+                bandwidth_bench_config.max_concurrent_runs,
+            ),
+            bandwidth_bench_config,
+            health_reporter,
+            mpc_abort_handle,
+        }
+    }
+}
+
+#[tonic::async_trait]
+#[cfg(not(feature = "insecure"))]
+impl<EP: Sync, UD: Sync, PD: Sync, KG: Sync, PP: Sync, CG: Sync, CM: Sync, BO: Sync> Shutdown
+    for ThresholdKms<EP, UD, PD, KG, PP, CG, CM, BO>
+{
+    fn shutdown(&self) -> anyhow::Result<JoinHandle<()>> {
+        let health_reporter = self.health_reporter.clone();
+        let tracker = Arc::clone(&self.tracker);
+        let mpc_abort_handle = self.mpc_abort_handle.abort_handle();
+        let handle = {
+            let new_handle_clone = mpc_abort_handle.clone();
+            tokio::task::spawn(async move {
+                health_reporter
+                    .set_not_serving::<CoreServiceEndpointServer<Self>>()
+                    .await;
+                tracing::trace!("Set not serving");
+                tracker.close();
+                tracker.wait().await;
+                mpc_abort_handle.abort();
+                let res: anyhow::Result<()> = retry_loop!(
+                    || {
+                        let new_handle_clone = new_handle_clone.clone();
+                        async move {
+                            if !new_handle_clone.is_finished() {
+                                return Err(anyhow::anyhow!("MPC server not done"));
+                            }
+                            Ok(())
+                        }
+                    },
+                    100,
+                    200
+                );
+                if let Err(e) = res {
+                    tracing::error!("Error waiting for MPC server to finish: {:?}", e);
+                }
+                tracing::info!("Threshold Core service endpoint server shutdown complete.");
+            })
+        };
+        Ok(handle)
+    }
+}
+
+#[cfg(not(feature = "insecure"))]
+impl<EP: Sync, UD: Sync, PD: Sync, KG: Sync, PP: Sync, CG: Sync, CM: Sync, BO: Sync> Drop
+    for ThresholdKms<EP, UD, PD, KG, PP, CG, CM, BO>
+{
+    fn drop(&mut self) {
+        let _ = self.shutdown();
+    }
+}

@@ -1,0 +1,124 @@
+use crate::{
+    galois_fields::{lagrange::LagrangeMap, lagrange::build_lagrange_map},
+    poly::Poly,
+    structure_traits::{Field, FromU128, One, Ring, RingWithExceptionalSequence, Sample, Zero},
+};
+use g2p::{GaloisField, g2p};
+use serde::{Deserialize, Serialize};
+use std::{num::NonZero, sync::LazyLock};
+
+g2p!(
+    GF8,
+    3,
+    // Polynomial X^3 + X + 1
+    modulus: 0b1011,
+);
+
+impl Zero for GF8 {
+    const ZERO: Self = <GF8 as GaloisField>::ZERO;
+}
+
+impl One for GF8 {
+    const ONE: Self = <GF8 as GaloisField>::ONE;
+}
+
+impl Sample for GF8 {
+    fn sample<R: rand::Rng>(rng: &mut R) -> Self {
+        let mut candidate = [0_u8; 1];
+        rng.fill_bytes(candidate.as_mut());
+        GF8::from(candidate[0])
+    }
+}
+impl Default for GF8 {
+    fn default() -> Self {
+        <GF8 as Zero>::ZERO
+    }
+}
+
+impl Serialize for GF8 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.0.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for GF8 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(GF8(u8::deserialize(deserializer)?))
+    }
+}
+
+impl FromU128 for GF8 {
+    fn from_u128(value: u128) -> Self {
+        GF8::from(value as u8)
+    }
+}
+
+impl Ring for GF8 {
+    const BIT_LENGTH: usize = 3;
+    const CHAR_LOG2: usize = 1;
+    const EXTENSION_DEGREE: usize = 3;
+    const NUM_BITS_STAT_SEC_BASE_RING: usize = 1;
+
+    fn to_byte_vec(&self) -> Vec<u8> {
+        self.0.to_le_bytes().to_vec()
+    }
+}
+
+const EXCEPTIONAL_SEQUENCE_SIZE: usize = 1 << GF8::BIT_LENGTH;
+
+impl RingWithExceptionalSequence for GF8 {
+    fn get_from_exceptional_sequence(idx: usize) -> anyhow::Result<Self> {
+        if idx >= EXCEPTIONAL_SEQUENCE_SIZE {
+            Err(anyhow::anyhow!(
+                "Index out of bounds for GF8 exceptional sequence"
+            ))
+        } else {
+            Ok(GF8::from(idx as u8))
+        }
+    }
+}
+
+/// Pre-computed Lagrange basis for all (ordered) non-empty subsets of GF8 that exclude 0.
+/// Size is \sum_{k=1}^{7} C(7, k) * k = 7 * 2^6 = 448, which is small enough to be pre-computed and stored in memory.
+pub(crate) static LAGRANGE_STORE: LazyLock<LagrangeMap<GF8>> = LazyLock::new(|| {
+    build_lagrange_map::<GF8>(NonZero::new(7).expect("7 is non-zero"), 0).expect(
+        "Initialization of the GF8 Lagrange basis can't fail with 7 parties and threshold 0",
+    )
+});
+
+impl Field for GF8 {
+    fn cached_lagrange_polys(points: &[Self]) -> Option<&'static [Poly<Self>]> {
+        LAGRANGE_STORE.get(points).map(|v| v.as_slice())
+    }
+}
+
+/// Computes the vector which is input ^ (2^i) for i=0..max_power.
+/// I.e. input, input^2, input^4, input^8, ...
+pub fn two_powers(input: GF8, max_power: usize) -> Vec<GF8> {
+    let mut res = Vec::with_capacity(max_power);
+    let mut temp = input;
+    res.push(temp);
+    for _i in 1..max_power {
+        temp = temp * temp;
+        res.push(temp);
+    }
+    res
+}
+
+//Pre-compute the set S defined in Fig.58 (i.e. GF8 from generator X)
+pub static GF8_FROM_GENERATOR: LazyLock<Vec<GF8>> = LazyLock::new(|| {
+    let generator = GF8::from(2);
+    (0..8)
+        .scan(GF8::from(1), |state, idx| {
+            let res = if idx == 7 { GF8::from(0) } else { *state };
+            *state = res * generator;
+            Some(res)
+        })
+        .collect()
+});

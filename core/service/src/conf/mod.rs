@@ -1,0 +1,694 @@
+use self::threshold::ThresholdPartyConf;
+use crate::util::rate_limiter::RateLimiterConfig;
+use clap::ValueEnum;
+use observability::{
+    conf::{Settings, TelemetryConfig},
+    telemetry::{ConfigTracing, SdkTracerProvider, init_telemetry},
+};
+use serde::{Deserialize, Serialize};
+use std::{cmp, path::PathBuf};
+use strum_macros::EnumIs;
+use url::Url;
+use validator::{Validate, ValidationErrors};
+
+pub mod threshold;
+
+/// Common configuration parameters that should be set in all scenarios
+/// WARNING: this may be printed for debugging and hence should NOT contain any secrets, such as private keys.
+/// If minor secrets needs to be added, then ensure fields are annotated with `#[serde(skip_serializing)]` to avoid accidentally logging them.
+#[derive(Serialize, Deserialize, Validate, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct CoreConfig {
+    #[validate(nested)]
+    pub service: ServiceEndpoint,
+    #[validate(nested)]
+    pub enclave_bootstrap: Option<EnclaveBootstrapConfig>,
+    #[validate(nested)]
+    pub telemetry: Option<TelemetryConfig>,
+    #[validate(nested)]
+    pub aws: Option<AWSConfig>,
+    #[validate(nested)]
+    pub public_vault: Option<VaultConfig>,
+    #[validate(nested)]
+    pub private_vault: Option<VaultConfig>,
+    #[validate(nested)]
+    pub backup_vault: Option<VaultConfig>,
+    #[validate(nested)]
+    pub rate_limiter_conf: Option<RateLimiterConfig>,
+    #[validate(nested)]
+    pub bandwidth_benchmark: Option<BandwidthBenchmarkConfig>,
+    #[validate(nested)]
+    pub threshold: Option<ThresholdPartyConf>,
+    #[validate(nested)]
+    pub internal_config: Option<InternalConfig>,
+    #[validate(nested)]
+    pub migration: Option<MigrationConfig>,
+    #[cfg(feature = "insecure")]
+    pub mock_enclave: Option<bool>,
+}
+
+/// One-time migration input associating existing epochs with the context they belong to.
+///
+/// Before the epoch↔context association existed, epoch data was persisted without a context
+/// reference. Upgrading such a deployment requires attaching each legacy epoch to its owning
+/// context. This mapping supplies that information to the migration step in
+/// [`crate::engine::migration`]. It is consumed once and, because the migration is idempotent,
+/// becomes a no-op on subsequent startups.
+///
+/// IDs are hex-encoded strings (with or without a `0x` prefix); the migration code parses them
+/// into [`kms_grpc::identifiers::ContextId`] / [`kms_grpc::identifiers::EpochId`].
+///
+/// Should be removed in version 0.16.x or above
+#[derive(Serialize, Deserialize, Validate, Clone, Debug, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct MigrationConfig {
+    /// One entry per context, each listing the epochs that belong to that context.
+    #[serde(default)]
+    #[validate(nested)]
+    pub context_associations: Vec<ContextEpochAssociation>,
+}
+
+/// A single context together with the epochs associated with it.
+///
+/// Each epoch is associated with exactly one context, so a given epoch ID must not appear under
+/// more than one [`ContextEpochAssociation`].
+#[derive(Serialize, Deserialize, Validate, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ContextEpochAssociation {
+    /// Hex-encoded context ID that owns `epoch_ids`.
+    #[validate(length(min = 1))]
+    pub context_id: String,
+    /// Hex-encoded epoch IDs belonging to `context_id`.
+    pub epoch_ids: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Validate, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct InternalConfig {
+    #[validate(range(min = 1))]
+    pub num_tokio_threads: usize,
+    #[validate(range(min = 1))]
+    pub num_rayon_threads: usize,
+}
+
+impl Default for InternalConfig {
+    fn default() -> Self {
+        let num_threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let num_tokio_threads = num_threads.div_ceil(8);
+        let num_rayon_threads = cmp::max(1, num_threads.saturating_sub(num_tokio_threads));
+        InternalConfig {
+            num_tokio_threads,
+            num_rayon_threads,
+        }
+    }
+}
+
+/// WARNING: this may be printed for debugging and hence should NOT contain any secrets, such as private keys.
+/// If minor secrets needs to be added, then ensure fields are annotated with `#[serde(skip_serializing)]` to avoid accidentally logging them.
+#[derive(Serialize, Deserialize, Validate, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceEndpoint {
+    // gRPC endpoint for incoming client requests
+    #[validate(length(min = 1))]
+    pub listen_address: String,
+    #[validate(range(min = 1, max = 65535))]
+    pub listen_port: u16,
+    // gRPC request timeout
+    #[validate(range(min = 1))]
+    pub timeout_secs: u64,
+    // maximum gRPC message size in bytes
+    #[validate(range(min = 1, max = 2147483647))]
+    pub grpc_max_message_size: usize,
+}
+
+/// Caller-input bounds for the bandwidth benchmark diagnostic endpoint (threshold nodes only).
+///
+/// Every field caps an otherwise unbounded, caller-controlled quantity that the endpoint turns
+/// into memory allocation or peer traffic; without them the endpoint is a memory-exhaustion /
+/// peer-traffic amplification primitive. Defaults are deliberately conservative. Because the
+/// config is loaded with the `KMS_CORE` env prefix, a trusted test deployment can raise any of
+/// them without recompiling, e.g. `KMS_CORE__BANDWIDTH_BENCHMARK__MAX_PAYLOAD_BYTES=...`.
+///
+/// WARNING: this may be printed for debugging and hence should NOT contain any secrets, such as private keys.
+#[derive(Serialize, Deserialize, Validate, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BandwidthBenchmarkConfig {
+    /// Max per-session payload a caller may request, in bytes. Bounds the `vec![0; payload]`
+    /// allocation (then cloned per peer): an unbounded value aborts the process on OOM.
+    #[validate(range(min = 1))]
+    pub max_payload_bytes: u32,
+    /// Max benchmark sessions a caller may request, bounding the task fan-out.
+    #[validate(range(min = 1))]
+    pub max_sessions: u32,
+    /// Max combined base allocation (payload × sessions) across all concurrent sessions, in
+    /// bytes. The networking layer further clones each payload per peer, so this caps the
+    /// aggregate before that amplification rather than relying on the per-field limits alone.
+    #[validate(range(min = 1))]
+    pub max_total_bytes: u64,
+    /// Max benchmark duration a caller may request, in seconds (only applies to the `Duration`
+    /// kind). Without it an untrusted value drives a sustained per-peer send loop for up to the
+    /// whole server request timeout, turning the endpoint into a network-flood primitive.
+    #[validate(range(min = 1))]
+    pub max_duration_secs: u64,
+    /// Max benchmark runs allowed to execute concurrently on a node. Each run spawns up to
+    /// `max_sessions` sessions, every one allocating a payload the networking layer clones per
+    /// peer, so N in-flight requests multiply peak memory and outbound peer traffic by N. The
+    /// endpoint takes no rate-limiter permit, so concurrency is bounded here instead; it is a
+    /// diagnostic, so serializing runs is acceptable.
+    #[validate(range(min = 1))]
+    pub max_concurrent_runs: usize,
+}
+
+impl Default for BandwidthBenchmarkConfig {
+    fn default() -> Self {
+        Self {
+            max_payload_bytes: 1 << 28, // 256 MiB
+            max_sessions: 256,
+            max_total_bytes: 1 << 30, // 1 GiB
+            max_duration_secs: 60,
+            max_concurrent_runs: 1,
+        }
+    }
+}
+
+/// The enclave init script extracts networking configuration from the
+/// kms-server config before kms-server even starts. We add these fields to the
+/// config schema so serde validation wouldn't be thrown off by unknown
+/// fields. Kms-server doesn't actually use them.
+#[derive(Serialize, Deserialize, Validate, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct EnclaveBootstrapConfig {
+    // vsock to read fresh k8s web identity tokens from
+    #[validate(range(min = 1, max = 65535))]
+    pub web_identity_token_port: u16,
+}
+
+impl ConfigTracing for CoreConfig {
+    fn telemetry(&self) -> Option<TelemetryConfig> {
+        self.telemetry.clone()
+    }
+}
+
+/// Override AWS configuration when running in Nitro enclaves or in test
+/// environments
+/// WARNING: this may be printed for debugging and hence should NOT contain any secrets, such as private keys.
+/// If minor secrets needs to be added, then ensure fields are annotated with `#[serde(skip_serializing)]` to avoid accidentally logging them.
+#[derive(Serialize, Deserialize, Validate, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct AWSConfig {
+    #[validate(length(min = 1))]
+    pub region: String,
+    #[validate(length(min = 1))]
+    pub role_arn: Option<String>,
+    pub imds_endpoint: Option<Url>,
+    pub sts_endpoint: Option<Url>,
+    pub s3_endpoint: Option<Url>,
+    pub awskms_endpoint: Option<Url>,
+}
+
+/// Where and how to store the key material
+/// WARNING: this may be printed for debugging and hence should NOT contain any secrets, such as private keys.
+/// If minor secrets needs to be added, then ensure fields are annotated with `#[serde(skip_serializing)]` to avoid accidentally diclosing them.
+#[derive(Serialize, Deserialize, Validate, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct VaultConfig {
+    pub storage: Storage,
+    #[validate(nested)]
+    pub keychain: Option<Keychain>,
+}
+
+/// How to store the key material
+/// WARNING: this may be printed for debugging and hence should NOT contain any secrets, such as private keys.
+/// If minor secrets needs to be added, then ensure fields are annotated with `#[serde(skip_serializing)]` to avoid accidentally diclosing them.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, EnumIs)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum Storage {
+    Ram(RamStorage),
+    File(FileStorage),
+    S3(S3Storage),
+}
+
+impl Validate for Storage {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        match self {
+            Storage::Ram(_) => Ok(()),
+            Storage::File(s) => s.validate(),
+            Storage::S3(s) => s.validate(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Validate, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct RamStorage {}
+
+/// WARNING: this may be printed for debugging and hence should NOT contain any secrets, such as private keys.
+/// If minor secrets needs to be added, then ensure fields are annotated with `#[serde(skip_serializing)]` to avoid accidentally diclosing them.
+#[derive(Serialize, Deserialize, Validate, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct FileStorage {
+    pub path: PathBuf,
+    pub prefix: Option<String>,
+}
+
+/// WARNING: this may be printed for debugging and hence should NOT contain any secrets, such as private keys.
+/// If minor secrets needs to be added, then ensure fields are annotated with `#[serde(skip_serializing)]` to avoid accidentally diclosing them.
+#[derive(Serialize, Deserialize, Validate, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct S3Storage {
+    #[validate(length(min = 1))]
+    pub bucket: String,
+    #[validate(length(min = 1))]
+    pub prefix: Option<String>,
+}
+
+/// How to encrypt the key material
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, EnumIs)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum Keychain {
+    AwsKms(AwsKmsKeychain),
+    SecretSharing(SecretSharingKeychain),
+}
+
+/// derive(Validate) doesn't work on enums because the author of `validator` is
+/// too lazy to implement it, so we have to define a struct for each enum
+/// variant by hand and then write these trivial Validate instances by hand
+/// because `enum_dispatch` doesn't work on imported traits
+impl Validate for Keychain {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        match self {
+            Keychain::AwsKms(k) => k.validate(),
+            Keychain::SecretSharing(k) => k.validate(),
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Validate, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub struct AwsKmsKeychain {
+    #[validate(length(min = 1))]
+    pub root_key_id: String,
+    pub root_key_spec: AwsKmsKeySpec,
+}
+
+#[derive(Default, Serialize, Deserialize, Validate, Clone, Debug, PartialEq)]
+#[serde(default, rename_all = "snake_case")]
+pub struct SecretSharingKeychain {}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, EnumIs, ValueEnum)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum AwsKmsKeySpec {
+    Symm,
+    Asymm,
+}
+
+/// Initialize the configuration from the given file.
+pub fn init_conf<'a, T: Serialize + Deserialize<'a> + std::fmt::Debug>(
+    config_file: &str,
+) -> anyhow::Result<T> {
+    Settings::builder()
+        .path(config_file)
+        .env_prefix("KMS_CORE")
+        .build()
+        .init_conf()
+        .map_err(|e| e.into())
+}
+
+/// Initialize and validate the configuration from the given file and initialize tracing.
+pub async fn init_conf_kms_core_telemetry<
+    'a,
+    T: Serialize + Deserialize<'a> + std::fmt::Debug + ConfigTracing + Validate,
+>(
+    config_file: &str,
+) -> anyhow::Result<(T, SdkTracerProvider)> {
+    let full_config: T = init_conf(config_file)?;
+    full_config.validate()?;
+    let tracer_provider = init_telemetry(&full_config).await?;
+    Ok((full_config, tracer_provider))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::{
+        conf::threshold::{TlsCert, TlsConf, TlsKey},
+        util::rate_limiter::RateLimiterConfig,
+    };
+
+    #[test]
+    fn test_threshold_config() {
+        let core_config: CoreConfig =
+            init_conf("config/default_2").expect("default_2 config must parse");
+        core_config
+            .validate()
+            .expect("default_2 config should validate");
+
+        let threshold_config = core_config
+            .threshold
+            .as_ref()
+            .expect("threshold section required for threshold config");
+        assert_eq!(core_config.service.listen_address, "0.0.0.0");
+        assert_eq!(core_config.service.listen_port, 50200);
+        assert_eq!(threshold_config.listen_address, "0.0.0.0");
+        assert_eq!(threshold_config.listen_port, 50002);
+        assert_eq!(threshold_config.threshold, 1);
+        assert_eq!(threshold_config.num_sessions_preproc, Some(2));
+
+        let peers = threshold_config
+            .peers
+            .as_ref()
+            .expect("peers must be present");
+        assert_eq!(peers.len(), 4);
+        for (i, (addr, port)) in [("p1", 50001), ("p2", 50002), ("p3", 50003), ("p4", 50004)]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(peers[i].address, addr, "peer[{i}] address mismatch");
+            assert_eq!(peers[i].port, port, "peer[{i}] port mismatch");
+            assert_eq!(peers[i].party_id, i + 1, "peer[{i}] party_id mismatch");
+            assert!(
+                peers[i].tls_cert.is_some(),
+                "peer[{i}] expected a TLS cert path"
+            );
+            let cert = Some(TlsCert::Path(PathBuf::from(format!(
+                "certs/cert_{addr}.pem"
+            ))));
+            assert_eq!(peers[i].tls_cert, cert, "peer[{i}] TLS cert mismatch");
+        }
+
+        let tls_config = threshold_config
+            .tls
+            .as_ref()
+            .expect("tls config must be present");
+        assert_eq!(
+            tls_config,
+            &TlsConf::Manual {
+                cert: TlsCert::Path(PathBuf::from(r"certs/cert_p2.pem")),
+                key: TlsKey::Path(PathBuf::from(r"certs/key_p2.pem")),
+            }
+        );
+
+        let private_vault = core_config.private_vault.unwrap();
+
+        assert_eq!(
+            private_vault.storage,
+            Storage::File(FileStorage {
+                path: PathBuf::from("./keys"),
+                prefix: Some("PRIV-p2".to_string()),
+            })
+        );
+
+        assert_eq!(
+            core_config.public_vault.unwrap().storage,
+            Storage::File(FileStorage {
+                path: PathBuf::from("./keys"),
+                prefix: Some("PUB-p2".to_string()),
+            })
+        );
+
+        assert_eq!(
+            core_config.rate_limiter_conf.unwrap(),
+            RateLimiterConfig::default()
+        );
+
+        let core_to_core_net = threshold_config.core_to_core_net;
+        assert_eq!(core_to_core_net.message_limit, Some(70));
+        assert_eq!(core_to_core_net.multiplier, Some(2.0));
+        assert_eq!(core_to_core_net.max_interval, Some(60));
+        assert_eq!(core_to_core_net.initial_interval_ms, Some(100));
+        assert_eq!(core_to_core_net.max_elapsed_time, Some(300));
+        assert_eq!(core_to_core_net.network_timeout, Some(20));
+        assert_eq!(core_to_core_net.network_timeout_bk, Some(300));
+        assert_eq!(core_to_core_net.network_timeout_bk_sns, Some(1200));
+        assert_eq!(
+            core_to_core_net.max_en_decode_message_size,
+            Some(2147483648)
+        );
+        assert_eq!(core_to_core_net.session_update_interval_secs, Some(60));
+        assert_eq!(core_to_core_net.session_cleanup_interval_secs, Some(86400));
+        assert_eq!(
+            core_to_core_net.discard_inactive_sessions_interval,
+            Some(10800)
+        );
+        assert_eq!(
+            core_to_core_net.max_waiting_time_for_message_queue,
+            Some(60)
+        );
+        assert_eq!(
+            core_to_core_net.max_opened_inactive_sessions_per_party,
+            Some(2000)
+        );
+    }
+
+    #[test]
+    fn test_threshold_config_negative() {
+        // the test below assumes we're using a valid config with 4 parties and threshold 1, which is the case for the default configs
+        let core_config: CoreConfig = init_conf("config/default_2").expect("config must parse");
+        core_config
+            .validate()
+            .expect("baseline config must validate");
+
+        let mut cc = core_config.clone();
+        cc.threshold.as_mut().unwrap().my_id = Some(0);
+        let s = cc.validate().unwrap_err().to_string();
+        // the actual values are not ordered deterministically, so we just check for the generic error message
+        assert!(s.contains("Validation error:"));
+
+        let mut cc = core_config.clone();
+        cc.threshold.as_mut().unwrap().listen_port = 0;
+        let s = cc.validate().unwrap_err().to_string();
+        assert!(s.contains("Validation error:"));
+
+        let mut cc = core_config.clone();
+        cc.threshold.as_mut().unwrap().threshold = 0;
+        let s = cc.validate().unwrap_err().to_string();
+        assert!(s.contains("Validation error:"));
+
+        let mut cc = core_config.clone();
+        cc.threshold.as_mut().unwrap().threshold = 42;
+        let s = cc.validate().unwrap_err().to_string();
+        assert!(s.contains("Got t=42 but expected t=1 for n=4 parties"));
+
+        let mut cc = core_config.clone();
+        cc.threshold.as_mut().unwrap().listen_address = "".to_string();
+        let s = cc.validate().unwrap_err().to_string();
+        assert!(s.contains("Validation error:"));
+
+        let mut cc = core_config.clone();
+        cc.threshold.as_mut().unwrap().peers.as_mut().unwrap()[2].party_id = 123;
+        let s = cc.validate().unwrap_err().to_string();
+        assert!(s.contains("Peer party ID cannot be greater than the number of parties (4)."));
+    }
+
+    #[test]
+    fn test_centralized_config() {
+        let core_config: CoreConfig = init_conf("config/default_centralized").unwrap();
+        core_config
+            .validate()
+            .expect("centralized config must validate");
+        assert_eq!(core_config.service.listen_address, "0.0.0.0");
+        assert_eq!(core_config.service.listen_port, 50051);
+
+        let private_vault = core_config.private_vault.as_ref().expect("private_vault");
+
+        assert_eq!(
+            private_vault.storage,
+            Storage::File(FileStorage {
+                path: PathBuf::from("./keys"),
+                prefix: None,
+            })
+        );
+        assert!(private_vault.keychain.is_none(), "no keychain expected");
+        assert_eq!(
+            core_config.public_vault.unwrap().storage,
+            Storage::File(FileStorage {
+                path: PathBuf::from("./keys"),
+                prefix: None,
+            })
+        );
+        assert_eq!(
+            core_config.rate_limiter_conf.unwrap(),
+            RateLimiterConfig::default()
+        );
+        assert!(
+            core_config.threshold.is_none(),
+            "threshold section should be absent in centralized config"
+        );
+    }
+
+    #[test]
+    fn test_centralized_enclave_config() {
+        let core_config: CoreConfig = init_conf("config/default_centralized_enclave").unwrap();
+        core_config
+            .validate()
+            .expect("centralized enclave config must validate");
+
+        let enclave_bootstrap = core_config
+            .enclave_bootstrap
+            .as_ref()
+            .expect("enclave_bootstrap section required for enclave config");
+        assert_eq!(enclave_bootstrap.web_identity_token_port, 4100);
+    }
+
+    // -----------------------------------------------------------------------
+    // Compose config conformance: validate checked-in compose_*.toml files
+    // used by Docker Compose tests and referenced from client configs.
+    // These catch drift between config files and the CoreConfig struct.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn config_conformance_compose_1() {
+        let core_config: CoreConfig =
+            init_conf("config/compose_1").expect("compose_1 config must parse");
+        core_config
+            .validate()
+            .expect("compose_1 config must validate");
+
+        // Service endpoint
+        assert_eq!(core_config.service.listen_address, "0.0.0.0");
+        assert_eq!(core_config.service.listen_port, 50100);
+        assert_eq!(core_config.service.timeout_secs, 360);
+
+        // Public vault: S3 storage
+        let public_vault = core_config
+            .public_vault
+            .as_ref()
+            .expect("public_vault required");
+        assert_eq!(
+            public_vault.storage,
+            Storage::S3(S3Storage {
+                bucket: "kms".to_string(),
+                prefix: Some("PUB-p1".to_string()),
+            })
+        );
+
+        // Private vault: S3 storage (no keychain in compose)
+        let private_vault = core_config
+            .private_vault
+            .as_ref()
+            .expect("private_vault required");
+        assert_eq!(
+            private_vault.storage,
+            Storage::S3(S3Storage {
+                bucket: "kms".to_string(),
+                prefix: Some("PRIV-p1".to_string()),
+            })
+        );
+        assert!(
+            private_vault.keychain.is_none(),
+            "compose_1 should not have a keychain"
+        );
+
+        // Backup vault: file storage
+        let backup_vault = core_config
+            .backup_vault
+            .as_ref()
+            .expect("backup_vault required");
+        assert_eq!(
+            backup_vault.storage,
+            Storage::File(FileStorage {
+                path: PathBuf::from("./backup_vault"),
+                prefix: Some("BACKUP-p1".to_string()),
+            })
+        );
+
+        // Threshold section
+        let threshold = core_config
+            .threshold
+            .as_ref()
+            .expect("threshold section required");
+        assert_eq!(threshold.my_id, Some(1));
+        assert_eq!(threshold.threshold, 1);
+        assert_eq!(threshold.listen_port, 50001);
+        assert_eq!(threshold.num_sessions_preproc, Some(2));
+
+        // TLS: auto mode with trusted releases
+        assert!(
+            threshold.tls.as_ref().is_some_and(|t| t.is_auto()),
+            "compose_1 must use TLS auto mode"
+        );
+
+        // Peers: 4 parties
+        let peers = threshold.peers.as_ref().expect("peers must be present");
+        assert_eq!(peers.len(), 4);
+        for (i, peer) in peers.iter().enumerate() {
+            assert_eq!(peer.party_id, i + 1, "peer[{i}] party_id mismatch");
+            assert!(
+                peer.tls_cert.is_some(),
+                "peer[{i}] expected a TLS cert path"
+            );
+            assert!(
+                peer.mpc_identity.is_some(),
+                "peer[{i}] expected an mpc_identity"
+            );
+        }
+
+        // AWS config
+        let aws = core_config.aws.as_ref().expect("aws config required");
+        assert_eq!(aws.region, "us-east-1");
+        assert!(aws.s3_endpoint.is_some(), "s3_endpoint expected");
+    }
+
+    #[test]
+    fn config_conformance_compose_centralized() {
+        let core_config: CoreConfig =
+            init_conf("config/compose_centralized").expect("compose_centralized config must parse");
+        core_config
+            .validate()
+            .expect("compose_centralized config must validate");
+
+        // Service endpoint
+        assert_eq!(core_config.service.listen_address, "0.0.0.0");
+        assert_eq!(core_config.service.listen_port, 50051);
+
+        // Public vault: S3 storage
+        let public_vault = core_config
+            .public_vault
+            .as_ref()
+            .expect("public_vault required");
+        assert!(
+            public_vault.storage.is_s_3(),
+            "compose_centralized public vault must use S3"
+        );
+
+        // Private vault: file storage
+        let private_vault = core_config
+            .private_vault
+            .as_ref()
+            .expect("private_vault required");
+        assert_eq!(
+            private_vault.storage,
+            Storage::File(FileStorage {
+                path: PathBuf::from("./keys"),
+                prefix: None,
+            })
+        );
+
+        // Backup vault: file storage
+        let backup_vault = core_config
+            .backup_vault
+            .as_ref()
+            .expect("backup_vault required");
+        assert_eq!(
+            backup_vault.storage,
+            Storage::File(FileStorage {
+                path: PathBuf::from("./backup_vault"),
+                prefix: None,
+            })
+        );
+
+        // No threshold section
+        assert!(
+            core_config.threshold.is_none(),
+            "centralized compose must not have threshold section"
+        );
+
+        // AWS config
+        let aws = core_config.aws.as_ref().expect("aws config required");
+        assert_eq!(aws.region, "us-east-1");
+    }
+}

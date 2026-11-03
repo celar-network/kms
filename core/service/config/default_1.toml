@@ -1,0 +1,276 @@
+# This section is the configuration for the KMS service. Usually this is the
+# interface that the connector uses to submit requests and query for
+# responses.
+[service]
+
+# IP address that the TCP listener binds to. This endpoint should not be
+# exposed externally.
+listen_address = "0.0.0.0"
+
+# Port number that the TCP listener binds to.
+listen_port = 50100
+
+# The timeout (in seconds) for all gRPC request handlers.
+timeout_secs = 360
+
+# Maximum gRPC message size in bytes.
+grpc_max_message_size = 104857600 # 100 MiB
+
+# Set the AWS region and endpoint used by [public_vault.storage]
+# and/or [private_vault.storage], if the storage URL starts with "s3://".
+# If the storage URL is file-based, this configuration is ignored.
+[aws]
+region = "us-east-1"
+s3_endpoint = "http://dev-s3-mock:9000"
+
+# Public vault storage backend.
+[public_vault]
+
+# The public storage configuration.
+# We support storage.file, storage.s3 and storage.ram.
+# When file storage is used, a path must be given with an optional prefix,
+# if the prefix is not given, then "PUB" is used as the prefix.
+# When s3 storage is used, a bucket name must be given with an optional prefix,
+# if the prefix is not given, then "PUB" is used as the prefix as well.
+# When ram is used, there are no additional parameters.
+[public_vault.storage.file]
+path = "./keys"
+prefix = "PUB-p1"
+
+# [public_vault.storage.s3]
+# bucket = "kms"
+# prefix = "PUB-p1"
+
+# The private vault storage configuration.
+[private_vault]
+
+# We support storage.file, storage.s3 and storage.ram.
+# When file storage is used, a path must be given with an optional prefix,
+# if the prefix is not given, then "PRIV" is used as the prefix.
+# When s3 storage is used, a bucket name must be given with an optional prefix,
+# if the prefix is not given, then "PRIV" is used as the prefix as well.
+# When ram is used, there are no additional parameters.
+[private_vault.storage.file]
+path = "./keys"
+prefix = "PRIV-p1"
+
+# If S3 storage is used for private keys, it is recommended to run the Core inside
+# a Nitro Enclave to reduce leakage risk. Since Nitro enclaves do not have persistent
+# storage, private keys will be exported for long‑term storage in an encrypted container
+# after generation. The encryption mechanism is controlled by the keychain parameter.
+#
+# root_key_id is an AWS KMS key identifier for the root key to use during
+# private key import and export to and from the Nitro enclave. The AWS KMS key
+# policy for this root key should have only allow its use to known and attested
+# versions of the Core. (Unset by default)
+#
+# [private_vault.keychain.aws_kms]
+# root_key_id = "root_key_id"
+
+# root_key_spec is an AWS KMS key spec for the root key (valid choices are
+# "symm" and "asymm")
+# root_key_spec = "symm"
+
+# Backup vault storage backend.
+# If configured, most operations that write to the private vault
+# will also write to the backup vault.
+# We do not write PrssState to the backup vault since it can be regenerated easily.
+[backup_vault]
+
+# We support storage.file, storage.s3 and storage.ram.
+# When file storage is used, a path must be given with an optional prefix,
+# if the prefix is not given, then "BACKUP" is used as the prefix.
+# When s3 storage is used, a bucket name must be given with an optional prefix,
+# if the prefix is not given, then "BACKUP" is used as the prefix as well.
+# When ram is used, there are no additional parameters.
+[backup_vault.storage.file]
+path = "./backup_vault"
+prefix = "BACKUP-p1"
+
+# If backup is to be actively used in a secure manner, either the AWS KMS or custodian
+# backup approach must be selected. Note that at most ONE of these can be selected:
+# --- 1. Custodian backup ---
+# The following variable MUST be enabled.
+# [backup_vault.keychain.secret_sharing]
+# --- 2. AWS KMS backup ---
+# The following variables MUST be set:
+# [backup_vault.keychain.aws_kms]
+# root_key_id = "zama_kms_backup_root_key"
+# root_key_spec = "asymm"
+
+# Configuration for communicating with other KMS nodes.
+# Not needed when running in centralized mode.
+[threshold]
+
+# Address and port that the TCP listener binds to for inter‑core communication.
+# The threshold.listen_port must differ from service.listen_port.
+listen_address = "0.0.0.0"
+listen_port = 50001
+
+# This is an optional parameter tha specifies the initial party ID
+# of the MPC core that's given in the peerlist, specified under `[[threshold.peers]]`.
+#
+# It is needed when the KMS starts with a peerlist, otherwise it can be omitted.
+my_id = 1
+
+# Threshold is the number of corruptions that the protocol handles. Currently
+# it must be an integer value smaller than parties/3.
+threshold = 1
+
+# Total number of decryption (public/user) queries to keep in memory (completed + ongoing).
+dec_capacity = 10000
+
+# The minimum amount of completed decryption, respectively public/user decryption,
+# queries to cache. That is, once the system is fully saturated with queries,
+# i.e. going above dec_capacity then old and completed queries will be removed
+# from memory, starting with the oldest. The min_dec_cache is the minimum
+# amount of completed queries to keep cached. Hence once the system has been
+# saturated, the maximum amount of ongoing queries to have in the system is
+# dec_capacity-min_dec_cache.
+min_dec_cache = 6000
+
+# Number of concurrent preprocessing sessions for key generation.
+# Minimum is 2 (one for triple/randomness generation, one for bit preprocessing).
+# Production recommendation: num_sessions_preproc = 1.5 * #CPUs.
+num_sessions_preproc = 2
+
+# The type of decryption protocol to run.
+# Available types: NoiseFloodSmall or BitDecSmall
+decryption_mode = "NoiseFloodSmall"
+
+# Paths to optional TLS certificate and private key in the PEM
+# encoding. Alternatively, multiline blocks with PEM-formatted content. This is
+# used to establish mutual authentication with other cores.
+[threshold.tls.manual]
+cert.path = "certs/cert_p1.pem"
+key.path = "certs/key_p1.pem"
+
+# When running in an AWS Nitro enclave, it's recommended to rely on the
+# "auto" TLS scheme that derives party CA certificates from party signing
+# keys and uses remote attestation between parties.
+
+# Experimental. If enabled, the party will include will include information
+# about the key policy used for the private vault root key into the attestation
+# document and will expect the same from other parties.
+# [threshold.tls.auto]
+# attest_private_vault_root_key = false
+
+# Obligatory if "auto" TLS is used. The PCR values are the expected
+# measurements of the enclave image. If "auto" TLS is enabled, the party
+# will only connect to other parties that can attest to a set of PCR values on
+# this list.
+# [[threshold.tls.auto.trusted_releases]]
+# pcr0 = "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+# pcr1 = "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+# pcr2 = "000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+
+# Every core needs to be aware of all other cores. In the
+# future there should be an option to load this configuration from a blockchain
+# smart contract. At the moment they need to be loaded from the same
+# configuration file.
+#
+# The number of [[threshold.peers]] dictates the total number of parties. This
+# list should be the same for all parties. Addresses and ports below are for
+# communicating with the cores to perform MPC tasks.
+#
+# The field `mpc_identity` is used to identify the core in the MPC protocol.
+# It must match the subject common name (CN) in the TLS certificate.
+# This is how cores authenticate each other in the MPC protocol,
+# i.e., party-2 connecting to party-1 must prove that it is indeed party-2
+# and not any other party that's in the list of TLS certificates.
+# If it is not configured it default to the `address` field.
+#
+# NOTE: in the future the peer list will be removed and loaded from the context.
+# See zama-ai/kms-internal#2530
+[[threshold.peers]]
+party_id = 1
+address = "p1"
+mpc_identity = "p1"
+port = 50001
+tls_cert.path = "certs/cert_p1.pem"
+
+[[threshold.peers]]
+party_id = 2
+address = "p2"
+mpc_identity = "p2"
+port = 50002
+tls_cert.path = "certs/cert_p2.pem"
+
+[[threshold.peers]]
+party_id = 3
+address = "p3"
+mpc_identity = "p3"
+port = 50003
+tls_cert.path = "certs/cert_p3.pem"
+
+[[threshold.peers]]
+party_id = 4
+address = "p4"
+mpc_identity = "p4"
+port = 50004
+tls_cert.path = "certs/cert_p4.pem"
+
+# Core‑to‑core network configuration.
+# Optional; falls back to internal constants if omitted.
+[threshold.core_to_core_net]
+message_limit = 70
+multiplier = 2.0
+max_interval = 60
+initial_interval_ms = 100
+max_elapsed_time = 300
+network_timeout = 20
+network_timeout_bk = 300
+network_timeout_bk_sns = 1200
+max_en_decode_message_size = 2147483648
+# How often old and stale sessions will be cleaned
+session_update_interval_secs = 60
+# The time interval after which we completely forget about completed sessions
+session_cleanup_interval_secs = 86400 # 1 day
+# The time interval after which we discard inactive sessions, or active sessions that have not seen any activity
+discard_inactive_sessions_interval = 10800 # 3 hours (must exceed max preprocessing time ~44 min for Default params)
+# The maximum waiting time we wait for trying to push or fetch a message in the send/rec queue
+max_waiting_time_for_message_queue = 60
+# The maximum number of "Inactive" sessions a party can open at a given time
+max_opened_inactive_sessions_per_party = 2000
+
+[telemetry]
+tracing_service_name = "kms-threshold-1"
+# tracing_endpoint = "http://localhost:4317"
+tracing_otlp_timeout_ms = 10000
+metrics_bind_address = "0.0.0.0:9646"
+enable_sys_metrics = true
+
+[telemetry.batch]
+max_queue_size = 8192
+max_export_batch_size = 2048
+scheduled_delay_ms = 500
+
+# Optional rate limiting configuration. All parties **must** use the same
+# configuration, even on different hardware, to avoid diverging behavior which
+# could lead to uncontrolled issues the MPC protocol. The `bucket_size`
+# represents the total amount of tokens available for processing in the core.
+# The fields other fields represents the price of each operation in the core.
+# I.e. how many tokens will be taken while the operation is executing. If all
+# tokens are in use then the core will refuse further operations until a
+# sufficient amount of tokens are released.
+[rate_limiter_conf]
+bucket_size = 50000
+pub_decrypt = 1
+user_decrypt = 1
+crsgen = 100
+preproc = 25000
+keygen = 1000
+new_epoch = 1
+
+# Internal threading config (Tokio + Rayon pool sizes).
+# Must be the same across all parties to avoid diverging behavior.
+# If unset, defaults derive from available #CPUs.
+# Defaults:
+#   num_tokio_threads = ceil(#CPUs / 8)
+#   num_rayon_threads = #CPUs - num_tokio_threads
+# Total number of threads should be approximately equal to #CPUs.
+# Recommended to also set threshold.num_sessions_preproc = 1.5 * #CPUs.
+# Example for a 16‑core machine:
+# [internal_config]
+# num_tokio_threads = 2
+# num_rayon_threads = 14

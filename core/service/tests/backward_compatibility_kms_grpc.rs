@@ -1,0 +1,124 @@
+mod common;
+use common::load_and_unversionize;
+
+use backward_compatibility::{
+    PrivDataTypeTest, PubDataTypeTest, SignedPubDataHandleInternalTest, TestMetadataKmsGrpc,
+    TestType, Testcase, data_dir,
+    load::{DataFormat, TestFailure, TestResult, TestSuccess},
+    tests::{TestedModule, run_all_tests},
+};
+use kms_grpc::rpc_types::{PrivDataType, PubDataType, SignedPubDataHandleInternal};
+use kms_lib::engine::context::SoftwareVersion;
+use std::path::Path;
+
+fn test_signed_pub_data_handle_internal(
+    dir: &Path,
+    test: &SignedPubDataHandleInternalTest,
+    format: DataFormat,
+) -> Result<TestSuccess, TestFailure> {
+    let original_versionized: SignedPubDataHandleInternal =
+        load_and_unversionize(dir, test, format)?;
+
+    let new_versionized = SignedPubDataHandleInternal::new(
+        test.key_handle.to_string(),
+        test.signature.to_vec(),
+        test.external_signature.to_vec(),
+    );
+
+    if original_versionized != new_versionized {
+        Err(test.failure(
+            format!(
+                "Invalid signed pub data handle (internal):\n Expected :\n{original_versionized:?}\nGot:\n{new_versionized:?}"
+            ),
+            format,
+        ))
+    } else {
+        Ok(test.success(format))
+    }
+}
+
+fn test_pub_data_type(
+    dir: &Path,
+    test: &PubDataTypeTest,
+    format: DataFormat,
+) -> Result<TestSuccess, TestFailure> {
+    let original_versionized: PubDataType = load_and_unversionize(dir, test, format)?;
+
+    let new_versionized = PubDataType::DecompressionKey;
+
+    if original_versionized != new_versionized {
+        Err(test.failure(
+            format!(
+                "Invalid signed pub data handle (internal):\n Expected :\n{original_versionized:?}\nGot:\n{new_versionized:?}"
+            ),
+            format,
+        ))
+    } else {
+        Ok(test.success(format))
+    }
+}
+
+fn test_priv_data_type(
+    dir: &Path,
+    test: &PrivDataTypeTest,
+    format: DataFormat,
+) -> Result<TestSuccess, TestFailure> {
+    let original_versionized: PrivDataType = load_and_unversionize(dir, test, format)?;
+
+    // Canonical variant for the round-trip check: it must be present in *every* version whose
+    // data this test replays (0.11.1 onward). `ContextInfo` is the newest such variant — newer
+    // ones like `EpochData` don't exist in the older frozen vectors, so their data would never
+    // decode to it.
+    let new_versionized = PrivDataType::ContextInfo;
+
+    if original_versionized != new_versionized {
+        Err(test.failure(
+            format!(
+                "Invalid signed priv data handle (internal):\n Expected :\n{original_versionized:?}\nGot:\n{new_versionized:?}"
+            ),
+            format,
+        ))
+    } else {
+        Ok(test.success(format))
+    }
+}
+
+pub struct KmsGrpc;
+
+impl TestedModule for KmsGrpc {
+    type Metadata = TestMetadataKmsGrpc;
+    const METADATA_FILE: &'static str = "kms-grpc.ron";
+
+    fn run_test<P: AsRef<Path>>(
+        test_dir: P,
+        testcase: &Testcase<Self::Metadata>,
+        format: DataFormat,
+    ) -> TestResult {
+        match &testcase.metadata {
+            Self::Metadata::SignedPubDataHandleInternal(test) => {
+                test_signed_pub_data_handle_internal(test_dir.as_ref(), test, format).into()
+            }
+            Self::Metadata::PubDataType(test) => {
+                test_pub_data_type(test_dir.as_ref(), test, format).into()
+            }
+            Self::Metadata::PrivDataType(test) => {
+                test_priv_data_type(test_dir.as_ref(), test, format).into()
+            }
+        }
+    }
+}
+
+#[test]
+fn test_backward_compatibility_kms_grpc() {
+    let pkg_version = SoftwareVersion::current().expect("Current software version not valid. Check CARGO_PKG_VERSION format in the environment variable.");
+
+    let base_data_dir = data_dir();
+
+    let results = run_all_tests::<KmsGrpc>(&base_data_dir, &pkg_version.to_string());
+
+    for r in results.iter() {
+        if r.is_failure() {
+            panic!("Backward compatibility tests for the KmsGrpc module failed: {r:?}")
+        }
+    }
+}

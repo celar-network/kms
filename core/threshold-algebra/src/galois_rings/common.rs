@@ -1,0 +1,974 @@
+use super::utils::ArrayVisitor;
+use crate::{
+    base_ring::ToZ64,
+    matrix::compute_powers_list,
+    poly::Poly,
+    structure_traits::{
+        BaseRing, Derive, FromU128, Invert, One, QuotientMaximalIdeal, Ring,
+        RingWithExceptionalSequence, Sample, Solve, Solve1, ZConsts, Zero,
+    },
+    syndrome::{decode_syndrome, field_decode_hints, lagrange_numerators},
+};
+use error_utils::anyhow_error_and_log;
+
+use crate::PRSSConversions;
+use crate::structure_traits::Field;
+use threshold_types::role::Role;
+
+use crate::{
+    base_ring::{Z64, Z128},
+    sharing::shamir::{ShamirFieldPoly, ShamirSharings},
+    sharing::share::Share,
+};
+use anyhow::{Result, anyhow};
+use itertools::Itertools;
+use rand::{CryptoRng, Rng};
+use serde::{Deserialize, Serialize, ser::SerializeTuple};
+use shake::{ExtendableOutput, Shake256, Update, XofReader};
+use std::marker::PhantomData;
+use std::num::Wrapping;
+use std::{
+    collections::{HashMap, HashSet},
+    fmt::Display,
+    iter::Sum,
+    ops::{Add, AddAssign, Mul, Neg, Shl, Sub, SubAssign},
+};
+use tfhe_versionable::{Versionize, VersionsDispatch};
+use zeroize::Zeroize;
+
+/// Precompute for Reed–Solomon syndrome computation and decoding over the ring `ResiduePoly<Z, EXTENSION_DEGREE>`.
+///
+/// Every field here depends only on the ordered set of party [`Role`]s holding the shares — and the threshold `t`,
+/// never on share values. It is built once per committee with [`Self::new`] and reused across every sharing reshared
+/// against that committee (in resharing: one context per key component, shared by all elements of that component).
+///
+/// The fields are all computed together here in [`Self::new`] but consumed far apart in [`Self::compute`],
+/// [`Self::decode`], and [`Self::deltas`].
+/// Note that `new` embeds the same parties **two different ways**:
+///   * as ring points `αᵢ = embed(roleᵢ)`, which drive the syndrome mat-vec in [`Self::compute`];
+///   * as field points `roleᵢ` in the quotient field (`GF16`), which drive the per-bit field decode in [`Self::decode`].
+///
+/// **NOTE**: the shares passed to [`Self::compute`] must be in the **same order** as `parties` was in [`Self::new`] —
+/// index `i` lines up across `alpha_powers`, `inv_denoms`, and `sharing.shares`.
+pub struct SyndromeContext<Z: BaseRing, const EXTENSION_DEGREE: usize>
+where
+    ResiduePoly<Z, EXTENSION_DEGREE>: QuotientMaximalIdeal,
+{
+    /// Committee size `n`.
+    party_count: usize,
+    /// RS redundancy `r = n − (t + 1)`: the number of syndrome coefficients.
+    pub r: usize,
+    /// `alpha_powers[i][j] = αᵢʲ` for `j ∈ 0..r` (exponents `0..=r−1`), where `αᵢ = embed(roleᵢ)` is party `i`'s ring
+    /// point: the Vandermonde weights of the syndrome map. Read as `alpha_powers[i][j]` in [`Self::compute`].
+    alpha_powers: Vec<Vec<ResiduePoly<Z, EXTENSION_DEGREE>>>,
+    /// `inv_denoms[i] = 1 / Lᵢ(αᵢ) = 1 / ∏_{j≠i}(αᵢ − αⱼ)`, the inverse Lagrange denominator for party `i`. The second
+    /// factor of each syndrome term in [`Self::compute`] (`numerator * inv_denoms[i]`).
+    inv_denoms: Vec<ResiduePoly<Z, EXTENSION_DEGREE>>,
+    /// `deltas[i] = δᵢ(0) = Lᵢ(0) / Lᵢ(αᵢ)`, the coefficient mapping party `i`'s share to its contribution at
+    /// evaluation point `0`. Unused here; exposed via [`Self::deltas`] so `reshare.rs` can build its reconstruction
+    /// coefficients without recomputing numerators.
+    deltas: Vec<ResiduePoly<Z, EXTENSION_DEGREE>>,
+    /// Field-level inverse party points `1 / roleᵢ` (in the quotient field). Committee-invariant hint passed to
+    /// `decode_syndrome` in [`Self::decode`] for the error-location root search.
+    x_inv: Vec<<ResiduePoly<Z, EXTENSION_DEGREE> as QuotientMaximalIdeal>::QuotientOutput>,
+    /// Field-level error-magnitude factors `−roleᵢ · Lᵢ(roleᵢ)`. The second committee-invariant hint passed to
+    /// `decode_syndrome` in [`Self::decode`]; per error it is multiplied by the `ω/σ′` term.
+    error_normalizer:
+        Vec<<ResiduePoly<Z, EXTENSION_DEGREE> as QuotientMaximalIdeal>::QuotientOutput>,
+}
+
+impl<Z: BaseRing, const EXTENSION_DEGREE: usize> SyndromeContext<Z, EXTENSION_DEGREE>
+where
+    ResiduePoly<Z, EXTENSION_DEGREE>: QuotientMaximalIdeal,
+{
+    /// Build the committee-invariant precompute for `parties` (the ordered committee) and `threshold`.
+    ///
+    /// Runs once per committee. The steps are grouped by where the data is used (field-level decode hints, ring-level
+    /// syndrome weights, and the `deltas` handed to `reshare.rs`). See the type-level docs for the meaning of each
+    /// field.
+    pub fn new(parties: &[Role], threshold: usize) -> Result<Self> {
+        let party_count = parties.len();
+        // RS redundancy r = n − (t + 1); needs room for the parity, i.e. the committee must satisfy n > t + 1.
+        let r = party_count.checked_sub(threshold + 1).ok_or_else(|| {
+            anyhow!(
+                "committee size {party_count} is smaller than threshold + 1 = {}",
+                threshold + 1
+            )
+        })?;
+        // r == 0 (committee size exactly t + 1) leaves no redundancy: there are no syndrome coefficients, so error
+        // correction is impossible. Reject it here rather than let the empty syndrome surface as a downstream panic
+        // (`chunks_exact(0)` in `reshare.rs`) or an `r - 1` underflow in the `alpha_powers` precompute below.
+        if r == 0 {
+            return Err(anyhow!(
+                "committee size {party_count} equals threshold + 1 = {}: no RS redundancy, error correction is impossible",
+                threshold + 1
+            ));
+        }
+
+        // --- Field-level decode hints (consumed per bit-plane by `decode_syndrome` in `decode`) ---
+        // The parties as points of the quotient field (the field syndrome decoding runs in).
+        let parties_as_field_points = parties
+            .iter()
+            .map(RingWithExceptionalSequence::embed_role_to_exceptional_sequence)
+            .collect::<Result<Vec<_>>>()?;
+
+        // x_inv[i] = 1/roleᵢ (root search) and error_normalizer[i] = −roleᵢ·Lᵢ(roleᵢ) (error magnitude).
+        let (x_inv, error_normalizer) = field_decode_hints(&parties_as_field_points);
+
+        // --- Ring-level syndrome weights (consumed by the mat-vec in `compute`) ---
+        // The same parties, now embedded as ring points αᵢ = embed(roleᵢ). Ordering invariant: the shares passed to
+        // `compute` must line up, in order, with these `parties`.
+        let parties = parties
+            .iter()
+            .map(ResiduePoly::embed_role_to_exceptional_sequence)
+            .collect::<Result<Vec<ResiduePoly<Z, EXTENSION_DEGREE>>>>()?;
+        // Lagrange numerators Lᵢ(Z) = ∏_{j≠i}(Z − αⱼ) (the Lᵢ of Eq. 15 in the spec).
+        let lagrange_numerators = lagrange_numerators(&parties);
+        // alpha_powers[i][j] = αᵢʲ for j ∈ 0..r — the Vandermonde weights. `compute` only reads exponents up to r − 1,
+        // so we stop there (`compute_powers_list` yields `max_exponent + 1` powers per party, i.e. exponents 0..=r−1).
+        let alpha_powers = compute_powers_list(&parties, r - 1);
+        // inv_denoms[i] = 1 / Lᵢ(αᵢ): evaluate each numerator at its own point, then invert once.
+        let inv_denoms: Vec<ResiduePoly<Z, EXTENSION_DEGREE>> = parties
+            .iter()
+            .zip(&lagrange_numerators)
+            .map(|(alpha_i, ell_i)| ell_i.eval(alpha_i).invert())
+            .collect::<Result<_>>()?;
+
+        // --- Reconstruction coefficients for `reshare.rs` (exposed via `deltas`) ---
+        // δᵢ(0) = Lᵢ(0) / Lᵢ(αᵢ), reusing the numerators and inverse denominators just built.
+        let zero = ResiduePoly::get_from_exceptional_sequence(0)?;
+        let deltas: Vec<ResiduePoly<Z, EXTENSION_DEGREE>> = lagrange_numerators
+            .iter()
+            .zip(&inv_denoms)
+            .map(|(l_i, inv)| l_i.eval(&zero) * *inv)
+            .collect();
+
+        Ok(Self {
+            party_count,
+            r,
+            alpha_powers,
+            inv_denoms,
+            deltas,
+            x_inv,
+            error_normalizer,
+        })
+    }
+
+    /// Compute the syndrome polynomial given the [`ShamirSharings`].
+    pub fn compute(
+        &self,
+        sharing: &ShamirSharings<ResiduePoly<Z, EXTENSION_DEGREE>>,
+    ) -> Result<Poly<ResiduePoly<Z, EXTENSION_DEGREE>>> {
+        // This doesn't protect against a same-sized but wrong-order share. Callers **must** ensure the shares match up.
+        debug_assert_eq!(
+            sharing.shares.len(),
+            self.party_count,
+            "sharing size must match the committee that the hints were built for"
+        );
+        // `Poly::zeros` is safe here because the computation writes exactly `r` coefficients so no need to resize as we
+        // go.
+        let mut res = Poly::zeros(self.r);
+        // Compute syndrome coefficients: share values divided by the lagrange poly evaluation at each party ID's ring embedding
+        for (j, out) in res.coefs_mut().iter_mut().enumerate() {
+            let mut coef = ResiduePoly::ZERO;
+            for i in 0..sharing.shares.len() {
+                let y = sharing.shares[i].value();
+                coef += y * self.alpha_powers[i][j] * self.inv_denoms[i];
+            }
+            *out = coef;
+        }
+
+        Ok(res)
+    }
+
+    /// Decode the error in the given syndrome polynomial
+    pub fn decode(
+        &self,
+        mut syn_poly: Poly<ResiduePoly<Z, EXTENSION_DEGREE>>,
+    ) -> Result<Vec<ResiduePoly<Z, EXTENSION_DEGREE>>> {
+        // sum up the error vectors here
+        let mut e_res = vec![ResiduePoly::ZERO; self.party_count];
+        // If all parties are honest, the syndrome poly is zero => bail early
+        if syn_poly.is_zero() {
+            return Ok(e_res);
+        }
+
+        //  compute s_e^(j)/p mod p and decode
+        for bit_idx in 0..Z::BIT_LENGTH {
+            let sliced_syndrome_coefs: Vec<_> = syn_poly
+                .coefs()
+                .iter()
+                // TODO(dp): bit_compose looks slow, should be very quick. Defer to later, but check the impl. #3097
+                .map(|c| c.bit_compose(bit_idx))
+                .collect();
+
+            let sliced_syndrome = ShamirFieldPoly::from_coefs(sliced_syndrome_coefs);
+            // If this plane happened to be error free, save us the remaining work for this bit.
+            if sliced_syndrome.is_zero() {
+                continue;
+            }
+            // bit error in this for this bit-idx
+            let ej = decode_syndrome(sliced_syndrome, self.r, &self.x_inv, &self.error_normalizer);
+
+            // lift bit error into the ring
+            let lifted_e = ej
+                .iter()
+                .map(|e| ResiduePoly::bit_lift(*e, bit_idx))
+                .collect::<Result<Vec<_>>>()?;
+
+            // Add the lifted e^(j) to e
+            // Accumulate this plane's error; `zip_eq` will not panic unless `decode_syndrome` is broken.
+            for (e_res_e, lifted_e_e) in e_res.iter_mut().zip_eq(lifted_e.iter()) {
+                *e_res_e += *lifted_e_e;
+            }
+            // correction term in the ring (inside parenthesis in syndrome update)
+            let correction_shares = lifted_e
+                .iter()
+                .enumerate()
+                .map(|(idx, val)| Share::new(Role::indexed_from_zero(idx), *val))
+                .collect_vec();
+            let corrected_shamir = ShamirSharings {
+                shares: correction_shares,
+            };
+            let syndrome_correction = self.compute(&corrected_shamir)?;
+
+            // update syndrome with correction value
+            syn_poly = syn_poly - syndrome_correction;
+            // Check if all error content is absorbed and exit the loop early if that is the case.
+            if syn_poly.is_zero() {
+                break;
+            }
+        }
+
+        Ok(e_res)
+    }
+
+    /// Return a slice to the pre-computed delta_i's evaluated at zero.
+    pub fn deltas(&self) -> &[ResiduePoly<Z, EXTENSION_DEGREE>] {
+        &self.deltas
+    }
+}
+
+/// Represents an element Z_{2^bitlen}[X]/F[X]
+/// for F[X] of given EXTENSION_DEGREE.
+/// Corresponding irreducible polynomial are defined in `galois_fields`
+///
+/// This is also the 'value' of a single ShamirShare.
+#[derive(Clone, Copy, PartialEq, Hash, Eq, Debug, Zeroize, Versionize)]
+#[versionize(ResiduePolyVersions)]
+pub struct ResiduePoly<Z, const EXTENSION_DEGREE: usize> {
+    pub coefs: [Z; EXTENSION_DEGREE],
+}
+
+impl<Z: Default + Copy, const EXTENSION_DEGREE: usize> Default
+    for ResiduePoly<Z, EXTENSION_DEGREE>
+{
+    fn default() -> Self {
+        Self {
+            coefs: [Z::default(); EXTENSION_DEGREE],
+        }
+    }
+}
+
+impl<Z: Serialize, const EXTENSION_DEGREE: usize> Serialize for ResiduePoly<Z, EXTENSION_DEGREE> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut s = serializer.serialize_tuple(EXTENSION_DEGREE)?;
+        for coef in self.coefs.iter() {
+            s.serialize_element(coef)?;
+        }
+        s.end()
+    }
+}
+
+impl<'a, Z: Deserialize<'a>, const EXTENSION_DEGREE: usize> Deserialize<'a>
+    for ResiduePoly<Z, EXTENSION_DEGREE>
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'a>,
+    {
+        let coefs = deserializer.deserialize_tuple(
+            EXTENSION_DEGREE,
+            ArrayVisitor::<Z, EXTENSION_DEGREE>(PhantomData),
+        )?;
+        Ok(Self { coefs })
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, VersionsDispatch)]
+pub enum ResiduePolyVersions<Z, const EXTENSION_DEGREE: usize> {
+    V0(ResiduePoly<Z, EXTENSION_DEGREE>),
+}
+
+impl<Z: BaseRing, const EXTENSION_DEGREE: usize> FromU128 for ResiduePoly<Z, EXTENSION_DEGREE> {
+    fn from_u128(value: u128) -> Self {
+        Self::from_scalar(Z::from_u128(value))
+    }
+}
+
+//Cant do TryInto with generics, see https://github.com/rust-lang/rust/issues/50133#issuecomment-646908391
+pub struct TryFromWrapper<Z>(pub Z);
+impl<Z: Ring + std::fmt::Display, const EXTENSION_DEGREE: usize>
+    TryFrom<ResiduePoly<Z, EXTENSION_DEGREE>> for TryFromWrapper<Z>
+{
+    type Error = anyhow::Error;
+    fn try_from(poly: ResiduePoly<Z, EXTENSION_DEGREE>) -> Result<TryFromWrapper<Z>, Self::Error> {
+        Ok(TryFromWrapper(poly.to_scalar()?))
+    }
+}
+
+impl<Z: Clone, const EXTENSION_DEGREE: usize> ResiduePoly<Z, EXTENSION_DEGREE> {
+    pub fn from_scalar(x: Z) -> Self
+    where
+        Z: Zero,
+    {
+        let mut coefs = [Z::ZERO; EXTENSION_DEGREE];
+        coefs[0] = x;
+        ResiduePoly { coefs }
+    }
+
+    pub fn to_scalar(self) -> anyhow::Result<Z>
+    where
+        Z: Zero + PartialEq + Display + Copy,
+    {
+        for i in 1..EXTENSION_DEGREE {
+            if self.coefs[i] != Z::ZERO {
+                return Err(anyhow_error_and_log(format!(
+                    "Higher coefficient must be zero but was {}",
+                    self.coefs[i]
+                )));
+            }
+        }
+        Ok(self.coefs[0])
+    }
+
+    pub fn from_array(coefs: [Z; EXTENSION_DEGREE]) -> Self {
+        ResiduePoly { coefs }
+    }
+
+    pub fn from_vec(coefs: Vec<Z>) -> anyhow::Result<Self> {
+        if coefs.len() != EXTENSION_DEGREE {
+            return Err(anyhow_error_and_log(format!(
+                "Error: required {EXTENSION_DEGREE} coefficients, but got {}",
+                coefs.len()
+            )));
+        }
+        Ok(ResiduePoly {
+            coefs: coefs.try_into().map_err(|_| {
+                anyhow_error_and_log("Error converting coefficient vector into Z64Poly")
+            })?,
+        })
+    }
+
+    /// return coefficient at index
+    pub fn at(&self, index: usize) -> &Z {
+        &self.coefs[index]
+    }
+
+    // check that all coefficients are zero
+    pub fn is_zero(&self) -> bool
+    where
+        Z: Zero + PartialEq,
+    {
+        for c in self.coefs.iter() {
+            if c != &Z::ZERO {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl<Z: Zero + Sample + Copy, const EXTENSION_DEGREE: usize> Sample
+    for ResiduePoly<Z, EXTENSION_DEGREE>
+{
+    fn sample<R: Rng + CryptoRng>(rng: &mut R) -> Self {
+        let mut coefs = [Z::ZERO; EXTENSION_DEGREE];
+        for coef in coefs.iter_mut() {
+            *coef = Z::sample(rng);
+        }
+        ResiduePoly { coefs }
+    }
+}
+
+impl<Z: Zero + Clone, const EXTENSION_DEGREE: usize> Zero for ResiduePoly<Z, EXTENSION_DEGREE> {
+    const ZERO: Self = ResiduePoly {
+        coefs: [Z::ZERO; EXTENSION_DEGREE],
+    };
+}
+
+impl<Z: One + Zero + Copy, const EXTENSION_DEGREE: usize> One for ResiduePoly<Z, EXTENSION_DEGREE> {
+    const ONE: Self = {
+        let mut coefs = [Z::ZERO; EXTENSION_DEGREE];
+        coefs[0] = Z::ONE;
+        ResiduePoly { coefs }
+    };
+}
+
+impl<Z: One + Zero + ZConsts + Copy, const EXTENSION_DEGREE: usize> ZConsts
+    for ResiduePoly<Z, EXTENSION_DEGREE>
+{
+    const TWO: Self = {
+        let mut coefs = [Z::ZERO; EXTENSION_DEGREE];
+        coefs[0] = Z::TWO;
+        ResiduePoly { coefs }
+    };
+
+    const THREE: Self = {
+        let mut coefs = [Z::ZERO; EXTENSION_DEGREE];
+        coefs[0] = Z::THREE;
+        ResiduePoly { coefs }
+    };
+
+    const MAX: Self = {
+        let mut coefs = [Z::ZERO; EXTENSION_DEGREE];
+        coefs[0] = Z::MAX;
+        ResiduePoly { coefs }
+    };
+}
+
+impl<Z: Zero + Copy + AddAssign, const EXTENSION_DEGREE: usize> Sum<Self>
+    for ResiduePoly<Z, EXTENSION_DEGREE>
+{
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        let mut coefs = [Z::ZERO; EXTENSION_DEGREE];
+        for poly in iter {
+            for (i, coef) in coefs.iter_mut().enumerate() {
+                *coef += poly.coefs[i];
+            }
+        }
+        // implicit mod reduction on `coefs`
+        Self { coefs }
+    }
+}
+
+impl<Z, const EXTENSION_DEGREE: usize> Add<Self> for ResiduePoly<Z, EXTENSION_DEGREE>
+where
+    Z: Copy,
+    Z: AddAssign<Z>,
+{
+    type Output = Self;
+    fn add(mut self, other: ResiduePoly<Z, EXTENSION_DEGREE>) -> Self::Output {
+        for i in 0..EXTENSION_DEGREE {
+            self.coefs[i] += other.coefs[i];
+        }
+        self
+    }
+}
+
+impl<Z, const EXTENSION_DEGREE: usize> AddAssign<Self> for ResiduePoly<Z, EXTENSION_DEGREE>
+where
+    Z: AddAssign + Copy,
+{
+    fn add_assign(&mut self, other: Self) {
+        for i in 0..EXTENSION_DEGREE {
+            self.coefs[i] += other.coefs[i];
+        }
+    }
+}
+
+impl<Z, const EXTENSION_DEGREE: usize> AddAssign<&Self> for ResiduePoly<Z, EXTENSION_DEGREE>
+where
+    Z: AddAssign + Copy,
+{
+    fn add_assign(&mut self, other: &ResiduePoly<Z, EXTENSION_DEGREE>) {
+        for i in 0..EXTENSION_DEGREE {
+            self.coefs[i] += other.coefs[i];
+        }
+    }
+}
+
+impl<Z: Neg<Output = Z> + Clone, const EXTENSION_DEGREE: usize> Neg
+    for ResiduePoly<Z, EXTENSION_DEGREE>
+{
+    type Output = Self;
+    fn neg(self) -> Self::Output {
+        ResiduePoly {
+            coefs: self.coefs.map(|x| -x),
+        }
+    }
+}
+
+impl<Z, const EXTENSION_DEGREE: usize> Sub<Self> for ResiduePoly<Z, EXTENSION_DEGREE>
+where
+    Z: Copy,
+    Z: SubAssign<Z>,
+{
+    type Output = Self;
+    fn sub(mut self, other: ResiduePoly<Z, EXTENSION_DEGREE>) -> Self::Output {
+        for i in 0..EXTENSION_DEGREE {
+            self.coefs[i] -= other.coefs[i];
+        }
+        ResiduePoly { coefs: self.coefs }
+    }
+}
+
+impl<Z, const EXTENSION_DEGREE: usize> SubAssign<Self> for ResiduePoly<Z, EXTENSION_DEGREE>
+where
+    Z: SubAssign + Copy,
+{
+    fn sub_assign(&mut self, other: ResiduePoly<Z, EXTENSION_DEGREE>) {
+        for i in 0..EXTENSION_DEGREE {
+            self.coefs[i] -= other.coefs[i];
+        }
+    }
+}
+
+impl<Z, const EXTENSION_DEGREE: usize> Add<&Self> for ResiduePoly<Z, EXTENSION_DEGREE>
+where
+    Z: Copy,
+    Z: AddAssign<Z>,
+{
+    type Output = Self;
+    fn add(mut self, other: &ResiduePoly<Z, EXTENSION_DEGREE>) -> Self::Output {
+        for i in 0..EXTENSION_DEGREE {
+            self.coefs[i] += other.coefs[i];
+        }
+        ResiduePoly { coefs: self.coefs }
+    }
+}
+
+impl<Z, const EXTENSION_DEGREE: usize> Sub<&Self> for ResiduePoly<Z, EXTENSION_DEGREE>
+where
+    Z: Copy,
+    Z: SubAssign<Z>,
+{
+    type Output = Self;
+    fn sub(mut self, other: &ResiduePoly<Z, EXTENSION_DEGREE>) -> Self::Output {
+        for i in 0..EXTENSION_DEGREE {
+            self.coefs[i] -= other.coefs[i];
+        }
+        ResiduePoly { coefs: self.coefs }
+    }
+}
+
+impl<Z, const EXTENSION_DEGREE: usize> Add<Z> for ResiduePoly<Z, EXTENSION_DEGREE>
+where
+    Z: AddAssign<Z> + Clone,
+{
+    type Output = Self;
+    fn add(mut self, other: Z) -> Self::Output {
+        // add const only to free term:
+        self.coefs[0] += other;
+        self
+    }
+}
+
+impl<Z, const EXTENSION_DEGREE: usize> Mul<Z> for ResiduePoly<Z, EXTENSION_DEGREE>
+where
+    Z: Copy,
+    Z: Mul<Z, Output = Z>,
+{
+    type Output = Self;
+    fn mul(self, other: Z) -> Self::Output {
+        ResiduePoly {
+            coefs: self.coefs.map(|x| x * other),
+        }
+    }
+}
+
+impl<Z, const EXTENSION_DEGREE: usize> Mul<Z> for &ResiduePoly<Z, EXTENSION_DEGREE>
+where
+    Z: Copy,
+    Z: Mul<Z, Output = Z>,
+{
+    type Output = ResiduePoly<Z, EXTENSION_DEGREE>;
+    fn mul(self, other: Z) -> Self::Output {
+        ResiduePoly {
+            coefs: self.coefs.map(|x| x * other),
+        }
+    }
+}
+
+impl<Z, const EXTENSION_DEGREE: usize> Add<Z> for &ResiduePoly<Z, EXTENSION_DEGREE>
+where
+    Z: Copy,
+    Z: AddAssign<Z>,
+{
+    type Output = ResiduePoly<Z, EXTENSION_DEGREE>;
+    fn add(self, other: Z) -> Self::Output {
+        // add const only to free term:
+        let mut coefs = self.coefs;
+        coefs[0] += other;
+        ResiduePoly { coefs }
+    }
+}
+
+/// Compute R << i which translates to left shifting by i each coefficient of the ResiduePoly
+/// If i >= Z::CHAR_LOG2 then it computes R << (i % Z::CHAR_LOG2)
+impl<Z, const EXTENSION_DEGREE: usize> Shl<usize> for ResiduePoly<Z, EXTENSION_DEGREE>
+where
+    Z: Ring + ZConsts,
+    Z: std::ops::Shl<usize, Output = Z>,
+{
+    type Output = Self;
+
+    fn shl(self, rhs: usize) -> Self::Output {
+        let mut coefs = self.coefs;
+        for coef in &mut coefs {
+            *coef = *coef << rhs;
+        }
+        ResiduePoly { coefs }
+    }
+}
+
+pub trait LutMulReduction<Z> {
+    fn reduce_mul(lower_coefs: &[Z]) -> Self;
+}
+
+impl<Z: BaseRing, const EXTENSION_DEGREE: usize> LutMulReduction<Z>
+    for ResiduePoly<Z, EXTENSION_DEGREE>
+where
+    ResiduePoly<Z, EXTENSION_DEGREE>: ReductionTable<Z, EXTENSION_DEGREE>,
+{
+    fn reduce_mul(coefs: &[Z]) -> Self {
+        let mut res = Self::from_array(coefs[0..EXTENSION_DEGREE].try_into().unwrap());
+        for (i, coef) in coefs.iter().enumerate().skip(EXTENSION_DEGREE) {
+            for j in 0..EXTENSION_DEGREE {
+                res.coefs[j] += *Self::REDUCTION_TABLES.entry(i, j) * *coef;
+            }
+        }
+        res
+    }
+}
+
+pub trait ReductionTable<Z: Clone, const EXTENSION_DEGREE: usize> {
+    const REDUCTION_TABLES: ReductionTables<Z, EXTENSION_DEGREE>;
+}
+
+/// Precomputes reductions of monomials of higher degree to help us in reducing polynomials
+/// after multiplication faster
+pub struct ReductionTables<Z: Clone, const EXTENSION_DEGREE: usize> {
+    /// NOTE: We only need up to EXTENSION_DEGREE - 1 but can't do `const` operations with generic
+    pub reduced: [ResiduePoly<Z, EXTENSION_DEGREE>; EXTENSION_DEGREE],
+}
+
+impl<Z: Clone, const EXTENSION_DEGREE: usize> ReductionTables<Z, EXTENSION_DEGREE> {
+    #[inline(always)]
+    pub fn entry(&self, deg: usize, idx_coef: usize) -> &Z {
+        &self.reduced[deg - EXTENSION_DEGREE].coefs[idx_coef]
+    }
+}
+
+impl<Z: BaseRing, const EXTENSION_DEGREE: usize> ResiduePoly<Z, EXTENSION_DEGREE> {
+    //Checks if each coefficient is a multiple of 2^exp
+    pub fn multiple_pow2(&self, exp: usize) -> bool {
+        assert!(exp <= Z::BIT_LENGTH);
+        if exp == Z::BIT_LENGTH {
+            return self.is_zero();
+        }
+        let bit_checks: Vec<_> = self
+            .coefs
+            .iter()
+            .filter_map(|c| {
+                let bit = (*c) & ((Z::ONE << exp) - Z::ONE);
+                if bit == Z::ZERO { None } else { Some(bit) }
+            })
+            .collect();
+
+        bit_checks.is_empty()
+    }
+}
+
+impl<const EXTENSION_DEGREE: usize> Derive for ResiduePoly<Z128, EXTENSION_DEGREE>
+where
+    Self: QuotientMaximalIdeal,
+{
+    /// Implements H_{LDS}, mapping to the exceptional sequence
+    /// via the finite field generator
+    fn derive_challenges_from_coinflip(
+        x: &Self,
+        g: u8,
+        l: usize,
+        roles: &HashSet<Role>,
+    ) -> HashMap<Role, Vec<Self>> {
+        // Observe that since the application of SHAKE256 is highly specific and needs to be optimized here,
+        // we don't use on the wrapper in `hashing.rs`
+        let mut hasher = Shake256::default();
+        hasher.update(&Self::DSEP_LDS);
+        //Update hasher with x
+        for x_coef in x.coefs {
+            //This line is the reason why it's not straightforward to implement Derive
+            //for ResiduePoly<Z> in general
+            hasher.update(&x_coef.0.to_le_bytes());
+        }
+
+        //Encode g on 1 byte
+        hasher.update(&g.to_le_bytes());
+
+        roles
+            .iter()
+            .map(|role| {
+                let mut hasher_cloned = hasher.clone();
+                //Encode role on two bytes
+                hasher_cloned.update(&(role.one_based() as u16).to_le_bytes());
+                let mut output_reader = hasher_cloned.finalize_xof();
+                let mut challenges_idx = vec![0u8; l];
+                output_reader.read(&mut challenges_idx);
+                let challenges = challenges_idx
+                    .iter()
+                    .map(|idx| {
+                        Self::bit_lift_from_idx((*idx as usize) % (1 << EXTENSION_DEGREE), 0)
+                            .unwrap()
+                    })
+                    .collect_vec();
+                (*role, challenges)
+            })
+            .collect()
+    }
+
+    const LOG_SIZE_EXCEPTIONAL_SET: usize = Self::QUOTIENT_OUTPUT_SIZE.ilog2() as usize;
+}
+
+impl<const EXTENSION_DEGREE: usize> Derive for ResiduePoly<Z64, EXTENSION_DEGREE>
+where
+    Self: QuotientMaximalIdeal,
+{
+    /// Implements H_{LDS}, mapping to the exceptional sequence
+    /// via the finite field generator
+    fn derive_challenges_from_coinflip(
+        x: &Self,
+        g: u8,
+        l: usize,
+        roles: &HashSet<Role>,
+    ) -> HashMap<Role, Vec<Self>> {
+        // Observe that since the application of SHAKE256 is highly specific and needs to be optimized here,
+        // we don't use on the wrapper in `hashing.rs`
+        let mut hasher = Shake256::default();
+        hasher.update(&Self::DSEP_LDS);
+        //Update hasher with x
+        for x_coef in x.coefs {
+            //This line is the reason why it's not straightforward to implement Derive
+            //for ResiduePoly<Z> in general
+            hasher.update(&x_coef.0.to_le_bytes());
+        }
+
+        //Encode g on 1 byte
+        hasher.update(&g.to_le_bytes());
+
+        roles
+            .iter()
+            .map(|role| {
+                let mut hasher_cloned = hasher.clone();
+                //Encode role on two bytes
+                hasher_cloned.update(&(role.one_based() as u16).to_le_bytes());
+                let mut output_reader = hasher_cloned.finalize_xof();
+                let mut challenges_idx = vec![0u8; l];
+                output_reader.read(&mut challenges_idx);
+                let challenges = challenges_idx
+                    .iter()
+                    .map(|idx| {
+                        Self::bit_lift_from_idx((*idx as usize) % (1 << EXTENSION_DEGREE), 0)
+                            .unwrap()
+                    })
+                    .collect_vec();
+                (*role, challenges)
+            })
+            .collect()
+    }
+
+    const LOG_SIZE_EXCEPTIONAL_SET: usize = Self::QUOTIENT_OUTPUT_SIZE.ilog2() as usize;
+}
+
+impl<Z: Ring, const EXTENSION_DEGREE: usize> RingWithExceptionalSequence
+    for ResiduePoly<Z, EXTENSION_DEGREE>
+where
+    ResiduePoly<Z, EXTENSION_DEGREE>: Ring,
+{
+    fn get_from_exceptional_sequence(idx: usize) -> anyhow::Result<Self> {
+        if idx >= (1 << EXTENSION_DEGREE) {
+            return Err(anyhow_error_and_log(format!(
+                "Value {idx} is too large to be embedded!"
+            )));
+        }
+
+        let mut coefs: [Z; EXTENSION_DEGREE] = [Z::ZERO; EXTENSION_DEGREE];
+
+        for (i, val) in coefs.iter_mut().enumerate().take(EXTENSION_DEGREE) {
+            let b = (idx >> i) & 1;
+            if b > 0 {
+                *val = Z::ONE;
+            }
+        }
+
+        Ok(ResiduePoly { coefs })
+    }
+}
+
+impl<Z: BaseRing, const EXTENSION_DEGREE: usize> Invert for ResiduePoly<Z, EXTENSION_DEGREE>
+where
+    ResiduePoly<Z, EXTENSION_DEGREE>: QuotientMaximalIdeal,
+{
+    /// invert and lift an Integer to the large Ring
+    fn invert(self) -> anyhow::Result<Self> {
+        if self == Self::ZERO {
+            return Err(anyhow_error_and_log("Cannot invert 0"));
+        }
+
+        let alpha_k = self.bit_compose(0);
+        let ainv = alpha_k.invert();
+        let mut x0 = Self::embed_quotient_exceptional_sequence(ainv)?;
+
+        // compute Newton-Raphson iterations
+        for _ in 0..Z::BIT_LENGTH.ilog2() {
+            x0 *= Self::TWO - self * x0;
+        }
+
+        debug_assert_eq!(x0 * self, Self::ONE);
+
+        Ok(x0)
+    }
+}
+
+impl<Z: BaseRing, const EXTENSION_DEGREE: usize> ResiduePoly<Z, EXTENSION_DEGREE>
+where
+    ResiduePoly<Z, EXTENSION_DEGREE>: QuotientMaximalIdeal,
+{
+    pub fn shamir_bit_lift(
+        x: &ShamirFieldPoly<<Self as QuotientMaximalIdeal>::QuotientOutput>,
+        pos: usize,
+    ) -> anyhow::Result<Poly<Self>> {
+        let coefs: Vec<Self> = x
+            .coefs()
+            .iter()
+            .map(|coef_2| Self::bit_lift(*coef_2, pos))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(Poly::from_coefs(coefs))
+    }
+}
+
+impl<Z: BaseRing, const EXTENSION_DEGREE: usize> Solve for ResiduePoly<Z, EXTENSION_DEGREE>
+where
+    ResiduePoly<Z, EXTENSION_DEGREE>: Solve1,
+    Self: Mul<Self, Output = Self>,
+{
+    //NIST: Level Zero Operation
+    ///***NOTE: CAREFUL WHEN NOT USING Z64 OR Z128 AS BASE RING***
+    fn solve(v: &Self) -> anyhow::Result<Self> {
+        //Check to help detect if we forgot about the note above
+        debug_assert_eq!(1 << Z::BIT_LENGTH.ilog2(), Z::BIT_LENGTH);
+        debug_assert!(
+            Z::MAX.to_byte_vec() == <Z64 as ZConsts>::MAX.to_byte_vec()
+                || Z::MAX.to_byte_vec() == <Z128 as ZConsts>::MAX.to_byte_vec()
+        );
+
+        let one = Self::ONE;
+        let two = Self::TWO;
+        let mut x = Self::solve_1(v)?;
+        let mut y = one;
+        // Do outer Newton Raphson
+        //NOTE: If the base ring isn't a power of 2, ilog2 is floor whereas we want ceil
+        for _i in 1..=Z::BIT_LENGTH.ilog2() {
+            // Do inner Newton Raphson to compute inverse of 1+2*x
+            // Observe that because we use modulo 2^64 and 2^128, which are 2^2^i values
+            // Hence there is no need to do the modulo operation of m as described in the NIST document.
+            let z = one + two * x;
+            y = y * (two - z * y);
+            y = y * (two - z * y);
+            x = (x * x + *v) * y;
+        }
+
+        // Validate the result, i.e. x+x^2 = input
+        //Note: This is a sanity check, we don't explicitly need it
+        if v != &(x + x * x) {
+            return Err(anyhow_error_and_log(
+                "The outer Newton Raphson inversion computation in solve() failed",
+            ));
+        }
+        Ok(x)
+    }
+}
+
+impl<const EXTENSION_DEGREE: usize> PRSSConversions for ResiduePoly<Z128, EXTENSION_DEGREE> {
+    fn from_u128_chunks(coefs: Vec<u128>) -> Self {
+        assert_eq!(coefs.len(), EXTENSION_DEGREE);
+        let mut poly_coefs = [Z128::ZERO; EXTENSION_DEGREE];
+        for (idx, coef) in coefs.into_iter().enumerate() {
+            poly_coefs[idx] = Wrapping(coef);
+        }
+        Self { coefs: poly_coefs }
+    }
+    fn from_i128(value: i128) -> Self {
+        Self::from_scalar(Wrapping(value as u128))
+    }
+
+    fn mul_by_i128(self, scalar: i128) -> Self {
+        // from_i128(scalar) is a scalar poly (only coef[0] is nonzero),
+        // so the full multiply reduces to simply scaling each coefficient.
+        let zscalar = Wrapping(scalar as u128); // signed scalar interpreted modulo 2^128 (Z128's modulus)
+        Self {
+            coefs: self.coefs.map(|c| c * zscalar),
+        }
+    }
+}
+
+impl<const EXTENSION_DEGREE: usize> PRSSConversions for ResiduePoly<Z64, EXTENSION_DEGREE> {
+    fn from_u128_chunks(coefs: Vec<u128>) -> Self {
+        assert_eq!(coefs.len(), EXTENSION_DEGREE);
+        let mut poly_coefs = [Z64::ZERO; EXTENSION_DEGREE];
+        for (idx, coef) in coefs.into_iter().enumerate() {
+            poly_coefs[idx] = Wrapping(coef as u64);
+        }
+        Self { coefs: poly_coefs }
+    }
+
+    /// Calling this means we are trying to produce
+    /// a Mask for post-SnS decryption using extesion of Z64
+    /// which is wrong
+    fn from_i128(_value: i128) -> Self {
+        panic!(
+            "Trying to call from_i128 for a Galois extension of Z64. This should only happen for extensions of Z128."
+        )
+    }
+}
+
+impl<const EXTENSION_DEGREE: usize> ResiduePoly<Z128, EXTENSION_DEGREE> {
+    pub fn to_residuepoly64(self) -> ResiduePoly<Z64, EXTENSION_DEGREE> {
+        let coefs = self.coefs;
+        let output_coefs = coefs.map(|coef| coef.to_z64());
+        ResiduePoly::<Z64, EXTENSION_DEGREE> {
+            coefs: output_coefs,
+        }
+    }
+}
+
+pub trait Monomials
+where
+    Self: Clone,
+{
+    fn monomials() -> Vec<Self>;
+}
+
+/// Given an array of residue polys p_0, p_1, ..., p_{n-1},
+/// convert them into chunks of size [F_DEG]
+/// (p_0, ..., p_{F_DEG-1}), (p_{F_DEG}, ..., p_{2F_DEG - 1}), ...
+/// then pack every [F_DEG] polynomial into one polynomial
+/// by multiplying every one by a different monomial.
+/// For example:
+/// q_0 = p_0 + p_1 * X + p_2 * X^2 + ... + p_{F_DEG-1} * X^{F_DEG-1},
+/// q_1 = p_{F_DEG} + p_{F_DEG + 1} * X + ... + p_{2 * F_DEG-1} * X^{F_DEG-1},
+/// q_2 = ...
+pub fn pack_residue_poly<const EXTENSION_DEGREE: usize, Z: BaseRing>(
+    polys: &[ResiduePoly<Z, EXTENSION_DEGREE>],
+) -> Vec<ResiduePoly<Z, EXTENSION_DEGREE>>
+where
+    ResiduePoly<Z, EXTENSION_DEGREE>: Monomials,
+    ResiduePoly<Z, EXTENSION_DEGREE>: Ring,
+{
+    let monomials = ResiduePoly::<Z, EXTENSION_DEGREE>::monomials();
+    polys
+        .chunks(EXTENSION_DEGREE)
+        .map(|chunk| {
+            let mut out = ResiduePoly::ZERO;
+            // Observe that if there is a difference in length between the chunk and the monomials it means the upper parts are implicitely 0
+            // thus it is fine to zip them together
+            for (p, monomial) in chunk.iter().zip(monomials.iter()) {
+                out += (*p) * (*monomial);
+            }
+            out
+        })
+        .collect()
+}

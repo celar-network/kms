@@ -1,0 +1,48 @@
+[package]
+name = "observability"
+version.workspace = true
+authors.workspace = true
+publish.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# ⚠️ IMPORTANT: Add new dependencies to workspace root Cargo.toml, NOT here!
+# Use .workspace = true to reference workspace dependencies
+# Maintain alphabetical order
+anyhow.workspace = true
+axum.workspace = true
+config.workspace = true
+http.workspace = true
+opentelemetry.workspace = true
+opentelemetry-http.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry-semantic-conventions.workspace = true
+opentelemetry-stdout.workspace = true
+opentelemetry_sdk.workspace = true
+prometheus.workspace = true
+serde = { workspace = true, features = ["derive", "rc"] }
+serde_json.workspace = true
+strum.workspace = true
+strum_macros.workspace = true
+sysinfo.workspace = true
+test-utils.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net"] }
+tonic.workspace = true
+tracing = { workspace = true, features = ["log", "async-await"] }
+tracing-appender.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "json"] }
+typed-builder.workspace = true
+uuid.workspace = true
+validator.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["strum"]
+
+[features]
+default = []

@@ -1,0 +1,1039 @@
+// === Standard Library ===
+use std::{collections::HashMap, marker::PhantomData, sync::Arc, time::Instant};
+
+// === External Crates ===
+use aes_prng::AesRng;
+use algebra::base_ring::Z64;
+use anyhow::anyhow;
+use kms_grpc::{
+    EpochId, RequestId,
+    identifiers::ContextId,
+    kms::v1::{self, CrsGenRequest, CrsGenResult, Empty},
+};
+use observability::{
+    metrics::{self, DurationGuard},
+    metrics_names::{
+        OP_CRS_GEN_ABORT, OP_CRS_GEN_REQUEST, OP_CRS_GEN_RESULT, OP_INSECURE_CRS_GEN_REQUEST,
+        TAG_PARTY_ID,
+    },
+};
+use threshold_execution::{
+    runtime::sessions::{base_session::BaseSession, session_parameters::GenericParameterHandles},
+    tfhe_internals::parameters::DKGParams,
+    zk::ceremony::Ceremony,
+};
+use threshold_types::network::NetworkMode;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock};
+use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tonic::{Request, Response};
+use tracing::Instrument;
+
+// === Internal Crate ===
+use crate::engine::utils::MetricedError;
+use crate::{
+    cryptography::{signatures::PrivateSigKey, signing::SigningSchemeType},
+    engine::{
+        base::{
+            BaseKmsStruct, CrsGenMetadata, DSEP_PUBDATA_CRS, compute_info_crs,
+            stored_scheme_signatures_to_proto,
+        },
+        threshold::{service::session::ImmutableSessionMaker, traits::CrsGenerator},
+        validation::{RequestIdParsingErr, parse_grpc_request_id, validate_crs_gen_request},
+    },
+    util::{
+        meta_store::{
+            MetaStore, MetaStorePermit, add_req_to_meta_store, retrieve_from_meta_store,
+            update_err_req_in_meta_store,
+        },
+        rate_limiter::RateLimiter,
+    },
+    vault::storage::{Storage, StorageExt, crypto_material::ThresholdCryptoMaterialStorage},
+};
+
+// === Insecure Feature-Specific Imports ===
+cfg_if::cfg_if! {
+    if #[cfg(feature = "insecure")] {
+        use crate::engine::{centralized::central_kms::async_generate_crs, threshold::traits::InsecureCrsGenerator};
+        use threshold_execution::{tfhe_internals::test_feature::transfer_crs};
+    }
+}
+
+cfg_if::cfg_if! {
+    if #[cfg(test)] {
+        use crate::vault::storage::ram;
+        use threshold_execution::malicious_execution::zk::ceremony::InsecureCeremony;
+    }
+}
+
+pub struct RealCrsGenerator<
+    PubS: Storage + Send + Sync + 'static,
+    PrivS: StorageExt + Send + Sync + 'static,
+    C: Ceremony + Send + Sync + 'static,
+> {
+    pub base_kms: BaseKmsStruct,
+    pub crypto_storage: ThresholdCryptoMaterialStorage<PubS, PrivS>,
+    pub crs_meta_store: Arc<RwLock<MetaStore<CrsGenMetadata>>>,
+    pub(crate) session_maker: ImmutableSessionMaker,
+    // Task tacker to ensure that we keep track of all ongoing operations and can cancel them if needed (e.g. during shutdown).
+    pub tracker: Arc<TaskTracker>,
+    // Map of ongoing crs generation tasks
+    pub ongoing: Arc<Mutex<HashMap<RequestId, CancellationToken>>>,
+    pub rate_limiter: RateLimiter,
+    pub(crate) _ceremony: PhantomData<C>,
+}
+
+impl<
+    PubS: Storage + Send + Sync + 'static,
+    PrivS: StorageExt + Send + Sync + 'static,
+    C: Ceremony + Send + Sync + 'static,
+> RealCrsGenerator<PubS, PrivS, C>
+{
+    async fn inner_crs_gen_from_request(
+        &self,
+        request: Request<CrsGenRequest>,
+        insecure: bool,
+    ) -> Result<Response<Empty>, MetricedError> {
+        // Retrieve the correct tag
+        let op_tag = if insecure {
+            OP_INSECURE_CRS_GEN_REQUEST
+        } else {
+            OP_CRS_GEN_REQUEST
+        };
+        let rate_limiter_permit = self.rate_limiter.start_crsgen(op_tag).await?;
+
+        let mut timer = metrics::METRICS.time_operation(op_tag).start();
+
+        let inner = request.into_inner();
+        let max_bits = inner.max_num_bits;
+        let verified = validate_crs_gen_request(inner, op_tag)?;
+        // Find the role of the current server and validate the context exists
+        let my_role = self
+            .session_maker
+            .my_role(&verified.context_id)
+            .await
+            .map_err(|e| {
+                MetricedError::new(op_tag, Some(verified.req_id), e, tonic::Code::NotFound)
+            })?;
+        let metric_tags = vec![(TAG_PARTY_ID, my_role.to_string())];
+        timer.tags(metric_tags);
+
+        // Ensure that no CRS already exists for a given request.
+        let already_exists = self
+            .crypto_storage
+            .inner
+            .crs_exists(&verified.req_id, &verified.epoch_id)
+            .await
+            .map_err(|e| {
+                MetricedError::new(op_tag, Some(verified.req_id), e, tonic::Code::Internal)
+            })?;
+        if already_exists {
+            return Err(MetricedError::new(
+                op_tag,
+                Some(verified.req_id),
+                anyhow::anyhow!(
+                    "CRS for request {} and epoch {} already exists in storage",
+                    verified.req_id,
+                    verified.epoch_id
+                ),
+                tonic::Code::AlreadyExists,
+            ));
+        }
+        let sigkey = self.base_kms.sig_key().map_err(|e| {
+            MetricedError::new(
+                op_tag,
+                Some(verified.req_id),
+                e,
+                tonic::Code::FailedPrecondition,
+            )
+        })?;
+        let meta_permit =
+            add_req_to_meta_store(&self.crs_meta_store, &verified.req_id, op_tag).await?;
+        tracing::info!(
+            "Starting crs generation on kms for request ID {:?}, context ID {:?}, max_num_bits {:?}",
+            verified.req_id,
+            verified.context_id,
+            max_bits
+        );
+        // NOTE: everything inside this function will cause an Aborted error code
+        // so before calling it we should do as much validation as possible without modifying state
+        self.inner_crs_gen(
+            verified.req_id,
+            verified.witness_dim,
+            max_bits,
+            verified.params,
+            &verified.eip712_domain,
+            verified.extra_data,
+            verified.signing_schemes,
+            rate_limiter_permit,
+            meta_permit,
+            verified.epoch_id,
+            verified.context_id,
+            sigkey,
+            timer,
+            insecure,
+        )
+        .await
+        .map_err(|e| MetricedError::new(op_tag, Some(verified.req_id), e, tonic::Code::Internal))?;
+        Ok(Response::new(Empty {}))
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    async fn inner_crs_gen(
+        &self,
+        req_id: RequestId,
+        witness_dim: usize,
+        max_num_bits: Option<u32>,
+        dkg_params: DKGParams,
+        eip712_domain: &alloy_sol_types::Eip712Domain,
+        extra_data: Vec<u8>,
+        signing_schemes: Vec<SigningSchemeType>,
+        rate_limiter_permit: OwnedSemaphorePermit,
+        meta_permit: MetaStorePermit<CrsGenMetadata>,
+        epoch_id: EpochId,
+        context_id: ContextId,
+        sk: Arc<PrivateSigKey>,
+        timer: DurationGuard<'static>,
+        insecure: bool,
+    ) -> anyhow::Result<()> {
+        let session_id = req_id.derive_session_id()?;
+        // CRS ceremony requires a sync network
+        let session = self
+            .session_maker
+            .make_base_session(session_id, context_id, NetworkMode::Sync)
+            .await?;
+
+        let meta_store = Arc::clone(&self.crs_meta_store);
+        let crypto_storage = self.crypto_storage.clone();
+        let eip712_domain_copy = eip712_domain.clone();
+
+        // we do not need to hold the handle,
+        // the result of the computation is tracked the crs_meta_store
+        let rng = self.base_kms.new_rng().await.to_owned();
+
+        let token = CancellationToken::new();
+        {
+            self.ongoing.lock().await.insert(req_id, token.clone());
+        }
+        let ongoing = Arc::clone(&self.ongoing);
+        self.tracker.spawn(
+            async move {
+                // Capture the timer inside the generation task, such that when the
+                // task exits, the timer is dropped and thus exported.
+                let _inner_timer = timer;
+                let _inner_rate_limiter_permit = rate_limiter_permit;
+                Self::crs_gen_background(
+                    meta_permit,
+                    token,
+                    &req_id,
+                    &epoch_id,
+                    witness_dim,
+                    max_num_bits,
+                    session,
+                    rng,
+                    meta_store,
+                    crypto_storage,
+                    sk,
+                    dkg_params.to_owned(),
+                    eip712_domain_copy,
+                    extra_data,
+                    signing_schemes,
+                    insecure,
+                )
+                .await;
+                // Cleanup runs on every termination
+                ongoing.lock().await.remove(&req_id);
+            }
+            .instrument(tracing::Span::current()),
+        );
+        Ok(())
+    }
+
+    async fn inner_get_result(
+        &self,
+        request: Request<v1::RequestId>,
+        insecure: bool,
+    ) -> Result<Response<CrsGenResult>, MetricedError> {
+        // Retrieve the correct tag
+        let op_tag = if insecure {
+            OP_INSECURE_CRS_GEN_REQUEST
+        } else {
+            OP_CRS_GEN_RESULT
+        };
+        let request_id =
+            parse_grpc_request_id(&request.into_inner(), RequestIdParsingErr::CrsGenResponse)
+                .map_err(|e| MetricedError::new(op_tag, None, e, tonic::Code::InvalidArgument))?;
+
+        let crs_data = retrieve_from_meta_store(&self.crs_meta_store, &request_id, op_tag).await?;
+
+        match crs_data.as_ref() {
+            CrsGenMetadata::Current(crs_data) => {
+                if crs_data.crs_id != request_id {
+                    return Err(MetricedError::new(
+                        op_tag,
+                        Some(request_id),
+                        anyhow!(
+                            "CRS Request ID mismatch: expected {}, got {}",
+                            request_id,
+                            crs_data.crs_id
+                        ),
+                        tonic::Code::Internal,
+                    ));
+                }
+                Ok(Response::new(CrsGenResult {
+                    request_id: Some(request_id.into()),
+                    crs_digest: crs_data.crs_digest.clone(),
+                    max_num_bits: crs_data.max_num_bits,
+                    external_signature: crs_data.external_signature.clone(),
+                    signatures: stored_scheme_signatures_to_proto(&crs_data.signatures),
+                }))
+            }
+            CrsGenMetadata::LegacyV0(_) => {
+                // This is a legacy result, we cannot return the crs_digest or external_signature
+                // as they're signed using a different SolStruct and hashed using a different domain separator
+                tracing::warn!(
+                    "Received a legacy CRS generation result,
+                not returning crs_digest or external_signature"
+                );
+                // The old SignedPubDataHandleInternal does not store max_num_bits
+                // so we have to read it from storage if we want to return it.
+                // But because this is a legacy result and the call path will not reach here
+                // (because a restart is needed to upgrade to the new version and the meta store is deleted from RAM)
+                // it is never needed, so we just return 0 for max_num_bits.
+                Ok(Response::new(CrsGenResult {
+                    request_id: Some(request_id.into()),
+                    crs_digest: vec![],
+                    max_num_bits: 0,
+                    external_signature: vec![],
+                    signatures: vec![],
+                }))
+            }
+        }
+    }
+
+    async fn inner_abort_crs_gen(
+        &self,
+        request: Request<v1::RequestId>,
+    ) -> Result<Response<Empty>, MetricedError> {
+        let parsed_id: RequestId =
+            parse_grpc_request_id(&request.into_inner(), RequestIdParsingErr::CrsGenAbort)
+                .map_err(|e| {
+                    MetricedError::new(OP_CRS_GEN_ABORT, None, e, tonic::Code::InvalidArgument)
+                })?;
+        // Find the token
+        let mut ongoing = self.ongoing.lock().await;
+        match ongoing.remove(&parsed_id) {
+            Some(token) => {
+                // Observe that the cancellation arm handles the abortion and clean-up
+                token.cancel();
+            }
+            None => {
+                return Err(MetricedError::new(
+                    OP_CRS_GEN_ABORT,
+                    Some(parsed_id),
+                    anyhow!("No ongoing CRS generation found for the supplied request ID"),
+                    tonic::Code::NotFound,
+                ));
+            }
+        }
+        Ok(Response::new(Empty {}))
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    async fn crs_gen_background(
+        permit: MetaStorePermit<CrsGenMetadata>,
+        cancel_token: CancellationToken,
+        req_id: &RequestId,
+        epoch_id: &EpochId,
+        witness_dim: usize,
+        max_num_bits: Option<u32>,
+        mut base_session: BaseSession,
+        rng: AesRng,
+        meta_store: Arc<RwLock<MetaStore<CrsGenMetadata>>>,
+        crypto_storage: ThresholdCryptoMaterialStorage<PubS, PrivS>,
+        sk: Arc<PrivateSigKey>,
+        params: DKGParams,
+        eip712_domain: alloy_sol_types::Eip712Domain,
+        extra_data: Vec<u8>,
+        signing_schemes: Vec<SigningSchemeType>,
+        insecure: bool,
+    ) {
+        tracing::info!(
+            "Starting crs gen background process for req_id={req_id:?} with witness_dim={witness_dim} and max_num_bits={max_num_bits:?}"
+        );
+        // Retrieve the correct tag
+        let op_tag = if insecure {
+            OP_INSECURE_CRS_GEN_REQUEST
+        } else {
+            OP_CRS_GEN_REQUEST
+        };
+
+        let crs_start_timer = Instant::now();
+        let pke_params = params.compact_pk_enc_params();
+        let extra_data_for_compute = extra_data.clone();
+        let domain_for_compute = eip712_domain.clone();
+        let generate_pp = async {
+            if insecure {
+                // sanity check to make sure we're using the insecure feature
+                #[cfg(not(feature = "insecure"))]
+                {
+                    let _ = rng; // stop clippy from complaining
+                    panic!(
+                        "attempting to call insecure crsgen when the insecure feature is not set"
+                    );
+                }
+                #[cfg(feature = "insecure")]
+                {
+                    let my_role = base_session.my_role();
+                    // We let the first party sample the seed (we are using 1-based party IDs)
+                    let input_party_id = 1;
+                    let domain = eip712_domain.clone();
+                    if my_role.one_based() == input_party_id {
+                        let crs_res = async_generate_crs(
+                            &sk,
+                            &signing_schemes,
+                            params,
+                            max_num_bits,
+                            domain,
+                            extra_data.clone(),
+                            req_id,
+                            rng,
+                        )
+                        .await;
+                        let crs = crs_res
+                            .map(|(crs, _)| crs)
+                            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+                        transfer_crs(&base_session, Some(crs), input_party_id).await
+                    } else {
+                        transfer_crs(&base_session, None, input_party_id).await
+                    }
+                }
+            } else {
+                // secure ceremony (insecure = false)
+                // CRS ceremony with production-sized params (e.g. 2048 bits) is CPU-intensive,
+                // each party's turn can take minutes. Increase the timeout to match BK SNS generation
+                // to prevent other parties from timing out and marking the computing party as corrupt.
+                base_session.network.set_timeout_for_bk_sns().await;
+                let real_ceremony = C::default();
+                let internal_pp = real_ceremony
+                    .execute::<Z64, _>(&mut base_session, witness_dim, max_num_bits)
+                    .await;
+                internal_pp.and_then(|internal| {
+                    internal.try_into_tfhe_zk_pok_pp(&pke_params, base_session.session_id())
+                })
+            }
+        };
+
+        // Race the long-running generation against cancellation.
+        let outcome: Result<(tfhe::zk::CompactPkeCrs, CrsGenMetadata), String> = tokio::select! {
+            biased;
+            () = cancel_token.cancelled() => Err(format!(
+                "CRS generation of request {req_id} aborted before completion because of a cancellation event"
+            )),
+            pp = generate_pp => pp
+                .and_then(|pp| compute_info_crs(
+                    &sk,
+                    &signing_schemes,
+                    &DSEP_PUBDATA_CRS,
+                    req_id,
+                    &pp,
+                    &domain_for_compute,
+                    extra_data_for_compute,
+                ).map(|info| (pp, info)))
+                .map_err(|e| e.to_string()),
+        };
+
+        match outcome {
+            Err(msg) => {
+                MetricedError::handle_unreturnable_error(
+                    op_tag,
+                    Some(*req_id),
+                    anyhow::anyhow!(msg.clone()),
+                );
+                let _ = crypto_storage
+                    .inner
+                    .purge_crs_material(req_id, epoch_id)
+                    .await;
+                let _ = update_err_req_in_meta_store(&meta_store, permit, msg, op_tag).await;
+            }
+            Ok((pp, crs_info)) => {
+                tracing::info!(
+                    "CRS generation completed for req_id={req_id} with digest={}, storing the CRS.",
+                    hex::encode(crs_info.digest())
+                );
+                // write_crs consumes the permit via update_meta_store internally
+                let res = crypto_storage
+                    .inner
+                    .write_crs(req_id, epoch_id, pp, crs_info, meta_store, permit, op_tag)
+                    .await;
+                let elapsed_time = Instant::now().duration_since(crs_start_timer);
+                if let Err(e) = res {
+                    tracing::error!("Failed to write CRS for request {req_id}: {e}");
+                } else {
+                    tracing::info!(
+                        "CRS stored. CRS ceremony time was {} ms",
+                        elapsed_time.as_millis()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl<
+    PubS: Storage + Send + Sync + 'static,
+    PrivS: StorageExt + Send + Sync + 'static,
+    C: Ceremony + Send + Sync + 'static,
+> CrsGenerator for RealCrsGenerator<PubS, PrivS, C>
+{
+    async fn crs_gen(
+        &self,
+        request: Request<CrsGenRequest>,
+    ) -> Result<Response<Empty>, MetricedError> {
+        self.inner_crs_gen_from_request(request, false).await
+    }
+
+    async fn get_result(
+        &self,
+        request: Request<v1::RequestId>,
+    ) -> Result<Response<CrsGenResult>, MetricedError> {
+        self.inner_get_result(request, false).await
+    }
+
+    async fn abort_crs_gen(
+        &self,
+        request: Request<v1::RequestId>,
+    ) -> Result<Response<Empty>, MetricedError> {
+        self.inner_abort_crs_gen(request).await
+    }
+}
+
+#[cfg(feature = "insecure")]
+pub struct RealInsecureCrsGenerator<
+    PubS: Storage + Send + Sync + 'static,
+    PrivS: StorageExt + Send + Sync + 'static,
+    C: Ceremony + Send + Sync + 'static,
+> {
+    pub real_crs_generator: RealCrsGenerator<PubS, PrivS, C>,
+}
+
+#[cfg(feature = "insecure")]
+impl<
+    PubS: Storage + Send + Sync + 'static,
+    PrivS: StorageExt + Send + Sync + 'static,
+    C: Ceremony + Send + Sync + 'static,
+> RealInsecureCrsGenerator<PubS, PrivS, C>
+{
+    pub async fn from_real_crsgen(value: &RealCrsGenerator<PubS, PrivS, C>) -> Self {
+        Self {
+            real_crs_generator: RealCrsGenerator {
+                base_kms: value.base_kms.new_instance().await,
+                crypto_storage: value.crypto_storage.clone(),
+                crs_meta_store: Arc::clone(&value.crs_meta_store),
+                session_maker: value.session_maker.clone(),
+                tracker: Arc::clone(&value.tracker),
+                ongoing: Arc::clone(&value.ongoing),
+                rate_limiter: value.rate_limiter.clone(),
+                _ceremony: PhantomData,
+            },
+        }
+    }
+}
+
+#[cfg(feature = "insecure")]
+#[tonic::async_trait]
+impl<
+    PubS: Storage + Send + Sync + 'static,
+    PrivS: StorageExt + Send + Sync + 'static,
+    C: Ceremony + Send + Sync + 'static,
+> InsecureCrsGenerator for RealInsecureCrsGenerator<PubS, PrivS, C>
+{
+    async fn insecure_crs_gen(
+        &self,
+        request: Request<CrsGenRequest>,
+    ) -> Result<Response<Empty>, MetricedError> {
+        tracing::info!("starting insecure crs gen in RealInsecureCrsGenerator");
+        self.real_crs_generator
+            .inner_crs_gen_from_request(request, true)
+            .await
+    }
+
+    async fn get_result(
+        &self,
+        request: Request<v1::RequestId>,
+    ) -> Result<Response<CrsGenResult>, MetricedError> {
+        self.real_crs_generator
+            .inner_get_result(request, true)
+            .await
+    }
+
+    async fn abort_crs_gen(
+        &self,
+        request: Request<v1::RequestId>,
+    ) -> Result<Response<Empty>, MetricedError> {
+        self.real_crs_generator.inner_abort_crs_gen(request).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use algebra::structure_traits::Ring;
+    use kms_grpc::{
+        kms::v1::FheParameter,
+        rpc_types::{KMSType, alloy_to_protobuf_domain},
+    };
+    use rand::SeedableRng;
+    use threshold_execution::{
+        runtime::sessions::base_session::BaseSessionHandles, small_execution::prss::PRSSSetup,
+        zk::ceremony::FinalizedInternalPublicParameter,
+    };
+    use threshold_types::protocol::ProtocolDescription;
+
+    use crate::{
+        consts::{DEFAULT_EPOCH_ID, DEFAULT_MPC_CONTEXT, DURATION_WAITING_ON_RESULT_SECONDS},
+        cryptography::signatures::gen_sig_keys,
+        dummy_domain,
+        engine::threshold::service::session::SessionMaker,
+        testing::utils::poll_result_until_ready,
+    };
+
+    use super::*;
+
+    impl<
+        PubS: Storage + Send + Sync + 'static,
+        PrivS: StorageExt + Send + Sync + 'static,
+        C: Ceremony + Send + Sync + 'static,
+    > RealCrsGenerator<PubS, PrivS, C>
+    {
+        async fn init_test(
+            base_kms: BaseKmsStruct,
+            pub_storage: PubS,
+            priv_storage: PrivS,
+            session_maker: ImmutableSessionMaker,
+        ) -> Self {
+            let crypto_storage = ThresholdCryptoMaterialStorage::new(
+                pub_storage,
+                priv_storage,
+                None,
+                HashMap::new(),
+            );
+
+            let tracker = Arc::new(TaskTracker::new());
+            let ongoing = Arc::new(Mutex::new(HashMap::new()));
+            let rate_limiter = RateLimiter::default();
+            Self {
+                base_kms,
+                crypto_storage,
+                crs_meta_store: MetaStore::new_unlimited(),
+                session_maker,
+                tracker,
+                ongoing,
+                rate_limiter,
+                _ceremony: PhantomData,
+            }
+        }
+
+        fn set_bucket_size(&mut self, bucket_size: usize) {
+            let config = crate::util::rate_limiter::RateLimiterConfig {
+                bucket_size,
+                ..Default::default()
+            };
+            self.rate_limiter = RateLimiter::new(config);
+        }
+    }
+
+    #[derive(Clone, Default)]
+    pub struct BrokenCeremony {}
+
+    impl ProtocolDescription for BrokenCeremony {
+        fn protocol_desc(depth: usize) -> String {
+            let indent = Self::INDENT_STRING.repeat(depth);
+            format!("{indent}-BrokenCeremony")
+        }
+    }
+
+    #[tonic::async_trait]
+    impl Ceremony for BrokenCeremony {
+        async fn execute<Z: Ring, S: BaseSessionHandles>(
+            &self,
+            _session: &mut S,
+            _witness_dim: usize,
+            _max_num_bits: Option<u32>,
+        ) -> anyhow::Result<FinalizedInternalPublicParameter> {
+            Err(anyhow::anyhow!("this is a broken ceremony"))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    pub struct SlowCeremony {}
+
+    impl ProtocolDescription for SlowCeremony {
+        fn protocol_desc(depth: usize) -> String {
+            let indent = Self::INDENT_STRING.repeat(depth);
+            format!("{indent}-SlowCeremony")
+        }
+    }
+
+    #[tonic::async_trait]
+    impl Ceremony for SlowCeremony {
+        async fn execute<Z: Ring, S: BaseSessionHandles>(
+            &self,
+            session: &mut S,
+            witness_dim: usize,
+            max_num_bits: Option<u32>,
+        ) -> anyhow::Result<FinalizedInternalPublicParameter> {
+            // Keep the ceremony running for a long time so the CRS entry stays
+            // `Pending` while the test issues a concurrent `get_result` / abort,
+            // letting those observe the in-flight state before completion.
+            tokio::time::sleep(Duration::from_secs(DURATION_WAITING_ON_RESULT_SECONDS + 10)).await;
+            let ceremony = InsecureCeremony {};
+            ceremony
+                .execute::<Z64, _>(session, witness_dim, max_num_bits)
+                .await
+        }
+    }
+
+    async fn make_crs_gen<C: Ceremony + 'static>(
+        rng: &mut AesRng,
+    ) -> RealCrsGenerator<ram::RamStorage, ram::RamStorage, C> {
+        let (_pk, sk) = gen_sig_keys(rng);
+        let base_kms = BaseKmsStruct::new(KMSType::Threshold, sk).unwrap();
+        let prss_setup_z128 = Some(PRSSSetup::new_testing_prss(vec![], vec![]));
+        let prss_setup_z64 = Some(PRSSSetup::new_testing_prss(vec![], vec![]));
+        let epoch_id = *DEFAULT_EPOCH_ID;
+        let session_maker = SessionMaker::four_party_dummy_session(
+            prss_setup_z128,
+            prss_setup_z64,
+            &epoch_id,
+            base_kms.new_rng().await,
+        );
+
+        let pub_storage = ram::RamStorage::new();
+        let priv_storage = ram::RamStorage::new();
+        RealCrsGenerator::<ram::RamStorage, ram::RamStorage, C>::init_test(
+            base_kms,
+            pub_storage,
+            priv_storage,
+            session_maker.make_immutable(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn invalid_argument() {
+        let mut rng = AesRng::seed_from_u64(123);
+        let crs_gen = make_crs_gen::<InsecureCeremony>(&mut rng).await;
+
+        let domain = alloy_to_protobuf_domain(&dummy_domain()).unwrap();
+        {
+            // missing request ID
+            let req = CrsGenRequest {
+                signing_schemes: vec![kms_grpc::kms::v1::SigningSchemeType::Ecdsa256k1 as i32],
+                params: FheParameter::Default as i32,
+                max_num_bits: None,
+                request_id: None,
+                domain: Some(domain),
+                extra_data: vec![],
+                context_id: Some((*DEFAULT_MPC_CONTEXT).into()),
+                epoch_id: Some((*DEFAULT_EPOCH_ID).into()),
+            };
+
+            let request = Request::new(req);
+            let res = crs_gen.crs_gen(request).await;
+
+            assert_eq!(res.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+            // same for the result, should give us an error with a bad request ID
+            assert_eq!(
+                crs_gen
+                    .get_result(Request::new(kms_grpc::kms::v1::RequestId {
+                        request_id: "xyz".to_string(),
+                    }))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+
+        {
+            // use the wrong fhe parameter
+            let req_id = RequestId::new_random(&mut rng);
+            let domain = alloy_to_protobuf_domain(&dummy_domain()).unwrap();
+            let req = CrsGenRequest {
+                signing_schemes: vec![kms_grpc::kms::v1::SigningSchemeType::Ecdsa256k1 as i32],
+                params: 200, // wrong parameter
+                max_num_bits: None,
+                request_id: Some(req_id.into()),
+                domain: Some(domain),
+                extra_data: vec![],
+                context_id: Some((*DEFAULT_MPC_CONTEXT).into()),
+                epoch_id: Some((*DEFAULT_EPOCH_ID).into()),
+            };
+
+            let request = Request::new(req);
+            let res = crs_gen.crs_gen(request).await;
+
+            assert_eq!(res.unwrap_err().code(), tonic::Code::InvalidArgument);
+        }
+
+        {
+            // missing domain
+            let req_id = RequestId::new_random(&mut rng);
+            let req = CrsGenRequest {
+                signing_schemes: vec![kms_grpc::kms::v1::SigningSchemeType::Ecdsa256k1 as i32],
+                params: FheParameter::Default as i32,
+                max_num_bits: None,
+                request_id: Some(req_id.into()),
+                domain: None,
+                extra_data: vec![],
+                context_id: Some((*DEFAULT_MPC_CONTEXT).into()),
+                epoch_id: Some((*DEFAULT_EPOCH_ID).into()),
+            };
+
+            let request = Request::new(req);
+            assert_eq!(
+                crs_gen.crs_gen(request).await.unwrap_err().code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+
+        {
+            // wrong domain
+            let mut domain = alloy_to_protobuf_domain(&dummy_domain()).unwrap();
+            domain.verifying_contract = "wrong_contract".to_string();
+            let req_id = RequestId::new_random(&mut rng);
+            let req = CrsGenRequest {
+                signing_schemes: vec![kms_grpc::kms::v1::SigningSchemeType::Ecdsa256k1 as i32],
+                params: FheParameter::Default as i32,
+                max_num_bits: None,
+                request_id: Some(req_id.into()),
+                domain: Some(domain),
+                extra_data: vec![],
+                context_id: Some((*DEFAULT_MPC_CONTEXT).into()),
+                epoch_id: Some((*DEFAULT_EPOCH_ID).into()),
+            };
+
+            let request = Request::new(req);
+            assert_eq!(
+                crs_gen.crs_gen(request).await.unwrap_err().code(),
+                tonic::Code::InvalidArgument
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn not_found() {
+        let mut rng = AesRng::seed_from_u64(123);
+        let crs_gen = make_crs_gen::<InsecureCeremony>(&mut rng).await;
+
+        let req_id = RequestId::new_random(&mut rng);
+        assert_eq!(
+            crs_gen
+                .get_result(Request::new(req_id.into()))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_exhausted() {
+        let mut rng = AesRng::seed_from_u64(123);
+        let mut crs_gen = make_crs_gen::<InsecureCeremony>(&mut rng).await;
+
+        // `ResourceExhausted` - If the KMS is currently busy with too many requests.
+        crs_gen.set_bucket_size(1);
+
+        let req_id = RequestId::new_random(&mut rng);
+        let domain = alloy_to_protobuf_domain(&dummy_domain()).unwrap();
+        let req = CrsGenRequest {
+            signing_schemes: vec![kms_grpc::kms::v1::SigningSchemeType::Ecdsa256k1 as i32],
+            params: FheParameter::Default as i32,
+            max_num_bits: None,
+            request_id: Some(req_id.into()),
+            domain: Some(domain),
+            extra_data: vec![],
+            context_id: Some((*DEFAULT_MPC_CONTEXT).into()),
+            epoch_id: Some((*DEFAULT_EPOCH_ID).into()),
+        };
+
+        let request = Request::new(req);
+        let res = crs_gen.crs_gen(request).await;
+
+        assert_eq!(res.unwrap_err().code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn internal_failure() {
+        // Even if the CRS ceremony fails, we should not return an error
+        // because it's happening in the background.
+        let mut rng = AesRng::seed_from_u64(123);
+        let crs_gen = make_crs_gen::<BrokenCeremony>(&mut rng).await;
+
+        let req_id = RequestId::new_random(&mut rng);
+        let domain = alloy_to_protobuf_domain(&dummy_domain()).unwrap();
+        let req = CrsGenRequest {
+            signing_schemes: vec![kms_grpc::kms::v1::SigningSchemeType::Ecdsa256k1 as i32],
+            params: FheParameter::Default as i32,
+            max_num_bits: None,
+            request_id: Some(req_id.into()),
+            domain: Some(domain),
+            extra_data: vec![],
+            context_id: Some((*DEFAULT_MPC_CONTEXT).into()),
+            epoch_id: Some((*DEFAULT_EPOCH_ID).into()),
+        };
+
+        // we expect the CRS generation call to pass, but only get an error when we try to retrieve the result
+        crs_gen.crs_gen(Request::new(req)).await.unwrap();
+
+        assert_eq!(
+            poll_result_until_ready(|| crs_gen.get_result(Request::new(req_id.into())))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Internal
+        );
+    }
+
+    #[cfg(feature = "slow_tests")]
+    #[tokio::test]
+    async fn unavailable() {
+        let mut rng = AesRng::seed_from_u64(123);
+        // use the slow CRS gen
+        let crs_gen = make_crs_gen::<SlowCeremony>(&mut rng).await;
+
+        let req_id = RequestId::new_random(&mut rng);
+
+        // start the ceremony but immediately fetch the result, it should be not found too
+        let domain = alloy_to_protobuf_domain(&dummy_domain()).unwrap();
+        let req = CrsGenRequest {
+            signing_schemes: vec![kms_grpc::kms::v1::SigningSchemeType::Ecdsa256k1 as i32],
+            params: FheParameter::Default as i32,
+            max_num_bits: None,
+            request_id: Some(req_id.into()),
+            domain: Some(domain),
+            extra_data: vec![],
+            context_id: Some((*DEFAULT_MPC_CONTEXT).into()),
+            epoch_id: Some((*DEFAULT_EPOCH_ID).into()),
+        };
+
+        let request = Request::new(req);
+        crs_gen.crs_gen(request).await.unwrap();
+        assert_eq!(
+            crs_gen
+                .get_result(Request::new(req_id.into()))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::Unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn already_exists() {
+        let mut rng = AesRng::seed_from_u64(123);
+        let crs_gen = make_crs_gen::<InsecureCeremony>(&mut rng).await;
+
+        let req_id = RequestId::new_random(&mut rng);
+        let domain = alloy_to_protobuf_domain(&dummy_domain()).unwrap();
+        let req = CrsGenRequest {
+            signing_schemes: vec![kms_grpc::kms::v1::SigningSchemeType::Ecdsa256k1 as i32],
+            params: FheParameter::Default as i32,
+            max_num_bits: None,
+            request_id: Some(req_id.into()),
+            domain: Some(domain),
+            extra_data: vec![],
+            context_id: Some((*DEFAULT_MPC_CONTEXT).into()),
+            epoch_id: Some((*DEFAULT_EPOCH_ID).into()),
+        };
+
+        crs_gen.crs_gen(Request::new(req.clone())).await.unwrap();
+
+        // we send the same request again, it should return an error
+        assert_eq!(
+            crs_gen.crs_gen(Request::new(req)).await.unwrap_err().code(),
+            tonic::Code::AlreadyExists
+        );
+    }
+
+    #[tokio::test]
+    async fn sunshine() {
+        let mut rng = AesRng::seed_from_u64(123);
+        let crs_gen = make_crs_gen::<InsecureCeremony>(&mut rng).await;
+
+        // Test that we can successfully generate a CRS
+        let req_id = RequestId::new_random(&mut rng);
+        let domain = alloy_to_protobuf_domain(&dummy_domain()).unwrap();
+        let req = CrsGenRequest {
+            signing_schemes: vec![kms_grpc::kms::v1::SigningSchemeType::Ecdsa256k1 as i32],
+            params: FheParameter::Default as i32,
+            max_num_bits: None,
+            request_id: Some(req_id.into()),
+            domain: Some(domain),
+            extra_data: vec![],
+            context_id: Some((*DEFAULT_MPC_CONTEXT).into()),
+            epoch_id: Some((*DEFAULT_EPOCH_ID).into()),
+        };
+
+        let request = Request::new(req);
+        crs_gen.crs_gen(request).await.unwrap();
+        let _crs = poll_result_until_ready(|| crs_gen.get_result(Request::new(req_id.into())))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn abort_not_found() {
+        let mut rng = AesRng::seed_from_u64(123);
+        let crs_gen = make_crs_gen::<InsecureCeremony>(&mut rng).await;
+        let req_id = RequestId::new_random(&mut rng);
+
+        let err = crs_gen
+            .abort_crs_gen(Request::new(req_id.into()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn abort_during_crs_gen() {
+        let mut rng = AesRng::seed_from_u64(123);
+        // SlowCeremony keeps the background task running long enough for abort to land
+        let crs_gen = make_crs_gen::<SlowCeremony>(&mut rng).await;
+        let req_id = RequestId::new_random(&mut rng);
+        let domain = alloy_to_protobuf_domain(&dummy_domain()).unwrap();
+        let req = CrsGenRequest {
+            signing_schemes: vec![kms_grpc::kms::v1::SigningSchemeType::Ecdsa256k1 as i32],
+            params: FheParameter::Default as i32,
+            max_num_bits: None,
+            request_id: Some(req_id.into()),
+            domain: Some(domain),
+            extra_data: vec![],
+            context_id: Some((*DEFAULT_MPC_CONTEXT).into()),
+            epoch_id: Some((*DEFAULT_EPOCH_ID).into()),
+        };
+
+        crs_gen.crs_gen(Request::new(req)).await.unwrap();
+        // We manage to abort successfully first time
+        assert!(
+            crs_gen
+                .abort_crs_gen(Request::new(req_id.into()))
+                .await
+                .is_ok()
+        );
+        // Second abort fails because the cancellation token has already been consumed
+        let err = crs_gen
+            .abort_crs_gen(Request::new(req_id.into()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+        let err = poll_result_until_ready(|| crs_gen.get_result(Request::new(req_id.into())))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Aborted);
+    }
+}

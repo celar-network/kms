@@ -1,0 +1,452 @@
+use anyhow::anyhow;
+use clap::Parser;
+use rcgen::{
+    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
+    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
+};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy)]
+enum CertFileType {
+    Der,
+    Pem,
+}
+
+#[derive(Debug, clap::Args)]
+#[group(required = true, multiple = false)]
+struct Group {
+    #[clap(short, long, value_parser, num_args = 1.., value_delimiter = ' ', help = "cannot be used with ca_prefix")]
+    ca_names: Vec<String>,
+
+    #[clap(long, default_value = "party", help = "cannot be used with ca_names")]
+    ca_prefix: String,
+}
+
+#[derive(Parser, Debug)]
+#[clap(name = "TLS Certificate Generator for MPC nodes")]
+#[clap(
+    about = "A CLI tool for generating separate TLS certificates for MPC nodes (cores). \
+The user needs to provide a set of CA names using either the \
+--ca_names option, or the --ca-prefix and the \
+--ca-count options. The tool also allows the user to set \
+the number of cores, output directory and file format. Example usage:\n
+./kms-gen-tls-certs --help # for all available options \n
+./kms-gen-tls-certs --ca-prefix c --ca-count 4 -n 1 -o certs \n
+./kms-gen-tls-certs --ca-names alice bob charlie dave -n 1 -o certs \n
+
+Under the hood, the tool generates self-signed CA certificates for \
+each CA and <num_cores> core certificates for each core.\
+The core certificates are signed by its corresponding CA. \
+The private key associated to each certificate can also be found in the output. \
+Finally, the combined CA certificate (cert_combined.{pem,der}) \
+is also a part of the output. \n
+Currently, the default is to use only a single CA certificate per logical party \
+and no separate core certificates."
+)]
+pub struct Cli {
+    // this group is needed to ensure the user only supplies the exact names or a prefix
+    #[clap(flatten)]
+    group: Group,
+
+    #[clap(long, default_value_t = 0, help = "only valid when ca-prefix is set")]
+    ca_count: u8,
+
+    #[clap(
+        short,
+        long,
+        default_value = "certs/",
+        help = "the output directory for certificates and keys"
+    )]
+    output_dir: PathBuf,
+
+    #[clap(
+        short,
+        long,
+        default_value = "0",
+        help = "the number of core certificates to generate for each CA. Can be set to 0 to only generate the CA certificates."
+    )]
+    num_cores: u32,
+
+    #[clap(
+        long,
+        default_value_t = false,
+        help = "Forces the generation of a self-signed certificate that is not a CA. Only compatible with num-cores set to 0. This certificate can thus be used directly as a TLS certificate for a core."
+    )]
+    force_self_signed_non_ca: bool,
+
+    #[clap(long, value_enum, default_value_t = CertFileType::Pem, help = "the output file type, select between pem and der")]
+    output_file_type: CertFileType,
+
+    #[clap(
+        long,
+        default_value_t = false,
+        help = "whether to include a wildcard SAN entry for the CA certificates"
+    )]
+    wildcard: bool,
+}
+
+/// Validates if a user-specified CA name is valid.
+/// By valid we mean if it is alphanumeric plus '-' and '.'.
+/// This should be changed to check CA names, that we actually want to allow.
+fn validate_ca_name(input: &str) -> anyhow::Result<()> {
+    for cur_char in input.chars() {
+        if !cur_char.is_ascii_alphanumeric() && cur_char != '-' && cur_char != '.' {
+            return Err(anyhow!("Error: invalid CA name: {}", input));
+        }
+    }
+    Ok(())
+}
+
+/// Write bytes to a filepath.
+/// The function will create the necessary directories in the path in order to write the [bytes].
+/// If the file already exists then it will be COMPLETELY OVERWRITTEN without warning.
+async fn write_bytes<S: AsRef<std::ffi::OsStr> + ?Sized, B: AsRef<[u8]>>(
+    file_path: &S,
+    bytes: B,
+) -> anyhow::Result<()> {
+    let path = Path::new(file_path);
+    // Create the parent directories of the file path if they don't exist
+    if let Some(p) = path.parent() {
+        tokio::fs::create_dir_all(p).await?
+    };
+    tokio::fs::write(path, bytes).await?;
+    Ok(())
+}
+
+/// create the keypair and self-signed certificate for the CA identified by the given name
+fn create_selfsigned_cert(
+    ca_name: &str,
+    wildcard: bool,
+    is_ca: bool,
+) -> anyhow::Result<(KeyPair, Certificate, CertificateParams)> {
+    let keypair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+    create_selfsigned_cert_from_keypair(ca_name, wildcard, is_ca, &keypair)
+        .map(|(_cert_ki, cert, params)| (keypair, cert, params))
+}
+
+/// Create a self-signed certificate using the supplied keypair. The first
+/// element in the returned tuple is the certificate subject key identifier
+/// which we currently only use for logging.
+/// Arguments:
+/// - ca_name: the name of the CA, which will be part of the certificate's common name and SAN entries
+/// - wildcard: whether to include a wildcard SAN entry for the CA certificate
+/// - is_ca: whether the generated self-signed certificate should have the CA flag set to true. If set to false, the generated certificate can be used directly as a TLS certificate for a core, without the need for generating separate core certificates.
+/// - sk: the keypair to generate the self-signed certificate
+pub fn create_selfsigned_cert_from_keypair<S: rcgen::SigningKey>(
+    ca_name: &str,
+    wildcard: bool,
+    is_ca: bool,
+    sk: &S,
+) -> anyhow::Result<(String, Certificate, CertificateParams)> {
+    validate_ca_name(ca_name)?;
+    let sans_vec = [
+        if wildcard {
+            vec![format!("*.{ca_name}")]
+        } else {
+            vec![]
+        },
+        vec![ca_name.to_string()],
+    ]
+    .concat();
+    let mut cp = CertificateParams::new(sans_vec)?;
+
+    // set distinguished name of CA cert
+    let mut distinguished_name = DistinguishedName::new();
+    distinguished_name.push(DnType::CommonName, ca_name); // this might be the one for docker deployment
+    // distinguished_name.push(DnType::CommonName, "127.0.0.1".to_string()); // this seems to be needed for local deployment
+    cp.distinguished_name = distinguished_name;
+
+    // Currently, we expect CA certificates to sign ephemeral TLS certificates
+    // direcly. So, ensure this certificate can only be used to sign end-user
+    // certificates, without any intermediate certificates. NB: we might change
+    // that in the future.
+    if is_ca {
+        cp.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
+    } else {
+        cp.is_ca = IsCa::ExplicitNoCa;
+    }
+
+    // set self-signed CA cert Key Usage Purposes
+    cp.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyCertSign,
+        KeyUsagePurpose::CrlSign,
+    ];
+
+    // self-sign cert with CA key
+    tracing::info!("Generating keys and cert for {:?}", cp.subject_alt_names[0]);
+    let cert = cp.self_signed(sk)?;
+    Ok((hex::encode(cp.key_identifier(sk)), cert, cp))
+}
+
+/// create a keypair and certificate for each of the `num_cores`, signed by the given CA
+fn create_core_certs<S: rcgen::SigningKey>(
+    ca_name: &str,
+    num_cores: usize,
+    issuing_ca: &Issuer<S>,
+    wildcard: bool,
+) -> anyhow::Result<HashMap<usize, (KeyPair, Certificate)>> {
+    (1..=num_cores)
+        .map(
+            |i: usize| -> anyhow::Result<(usize, (KeyPair, Certificate))> {
+                let core_name = format!("core{i}.{ca_name}");
+                let core_keypair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
+                let sans_vec = [
+                    if wildcard {
+                        vec![format!("*.{}", core_name.clone())]
+                    } else {
+                        vec![]
+                    },
+                    vec![core_name.clone()],
+                ]
+                .concat();
+                let mut cp = CertificateParams::new(sans_vec)?;
+
+                // set core cert CA flag to false
+                cp.is_ca = IsCa::ExplicitNoCa;
+
+                // set distinguished name of core cert
+                let mut distinguished_name = DistinguishedName::new();
+                distinguished_name.push(DnType::CommonName, core_name);
+                cp.distinguished_name = distinguished_name;
+
+                // set core cert Key Usage Purposes
+                cp.key_usages = vec![
+                    KeyUsagePurpose::DigitalSignature,
+                    KeyUsagePurpose::KeyEncipherment,
+                    KeyUsagePurpose::KeyAgreement,
+                ];
+
+                // set core cert Extended Key Usage Purposes
+                cp.extended_key_usages = vec![
+                    ExtendedKeyUsagePurpose::ServerAuth,
+                    ExtendedKeyUsagePurpose::ClientAuth,
+                ];
+
+                tracing::info!("Generating keys and cert for {:?}", cp.subject_alt_names[0]);
+                let core_cert = cp.signed_by(&core_keypair, issuing_ca)?;
+                Ok((i, (core_keypair, core_cert)))
+            },
+        )
+        .collect()
+}
+
+/// write the given certificate and keypair to the given path under the given name
+async fn write_certs_and_keys(
+    root_dir: &std::path::Path,
+    name: &str,
+    cert: &Certificate,
+    keypair: &KeyPair,
+    file_type: CertFileType,
+) -> anyhow::Result<()> {
+    tracing::info!("{}", cert.pem());
+    tracing::info!("{}", keypair.serialize_pem());
+
+    match file_type {
+        CertFileType::Der => {
+            let cert_dir = root_dir.join(format!("cert_{name}.der"));
+            write_bytes(&cert_dir, cert.der()).await?;
+
+            let key_dir = root_dir.join(format!("key_{name}.der"));
+            write_bytes(&key_dir, keypair.serialized_der()).await?;
+        }
+        CertFileType::Pem => {
+            let cert_dir = root_dir.join(format!("cert_{name}.pem"));
+            write_bytes(&cert_dir, cert.pem()).await?;
+
+            let key_dir = root_dir.join(format!("key_{name}.pem"));
+            write_bytes(&key_dir, keypair.serialize_pem()).await?;
+        }
+    };
+    Ok(())
+}
+
+/// Execute TLS certificate generation.
+pub async fn entry_point() -> anyhow::Result<()> {
+    let args = Cli::parse();
+
+    let ca_set: HashSet<String> = if args.group.ca_names.is_empty() {
+        HashSet::from_iter((1..=args.ca_count).map(|i| format!("{}{i}", args.group.ca_prefix)))
+    } else {
+        HashSet::from_iter(args.group.ca_names.iter().cloned())
+    };
+
+    let mut all_certs = vec![];
+
+    let is_ca = match (args.force_self_signed_non_ca, args.num_cores) {
+        (true, 0) => false,
+        (false, _) => true,
+        (true, n) => {
+            return Err(anyhow!(
+                "Invalid arguments: --force-self-signed-non-ca can only be true if --num-cores is set to 0. Current value of --num-cores: {n}"
+            ));
+        }
+    };
+
+    for ca_name in ca_set {
+        let (ca_keypair, ca_cert, ca_cert_params) =
+            create_selfsigned_cert(&ca_name, args.wildcard, is_ca)?;
+
+        write_certs_and_keys(
+            &args.output_dir,
+            &ca_name,
+            &ca_cert,
+            &ca_keypair,
+            args.output_file_type,
+        )
+        .await?;
+
+        let issuing_ca = Issuer::from_params(&ca_cert_params, &ca_keypair);
+        // only generate core certs, if specifically desired (currently not the default)
+        if args.num_cores > 0 {
+            let core_certs = create_core_certs(
+                &ca_name,
+                args.num_cores as usize,
+                &issuing_ca,
+                args.wildcard,
+            )?;
+
+            // write all core keypairs and certificates to disk
+            for (core_id, (core_keypair, core_cert)) in core_certs.iter() {
+                write_certs_and_keys(
+                    &args.output_dir,
+                    format!("{ca_name}-core{core_id}").as_str(),
+                    core_cert,
+                    core_keypair,
+                    args.output_file_type,
+                )
+                .await?;
+            }
+        }
+
+        all_certs.push(ca_cert);
+    }
+
+    // write the combined CA certificate
+    match args.output_file_type {
+        CertFileType::Der => {
+            let cert_dir = args.output_dir.join("cert_combined.der");
+            let buf: Vec<u8> = all_certs
+                .into_iter()
+                .flat_map(|cert| cert.der().to_vec())
+                .collect();
+            write_bytes(&cert_dir, buf).await?;
+        }
+        CertFileType::Pem => {
+            let cert_dir = args.output_dir.join("cert_combined.pem");
+            let buf: Vec<u8> = all_certs
+                .into_iter()
+                .flat_map(|cert| cert.pem().as_bytes().to_vec())
+                .collect();
+            write_bytes(&cert_dir, buf).await?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{create_core_certs, create_selfsigned_cert, validate_ca_name};
+    use rcgen::{Certificate, Issuer};
+    use tokio_rustls::rustls::pki_types::UnixTime;
+    use webpki::{EndEntityCert, KeyUsage, anchor_from_trusted_cert};
+
+    fn signed_verify(leaf_cert: &Certificate, ca_cert: &Certificate) -> anyhow::Result<()> {
+        let ee = EndEntityCert::try_from(leaf_cert.der())?;
+        let ta = [anchor_from_trusted_cert(ca_cert.der())?];
+
+        ee.verify_for_usage(
+            &[
+                webpki::aws_lc_rs::ECDSA_P256_SHA256,
+                webpki::aws_lc_rs::ECDSA_P256K1_SHA256,
+            ],
+            &ta,
+            &[],
+            UnixTime::now(),
+            KeyUsage::server_auth(),
+            None,
+            None,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_cert_chain() {
+        let ca_name = "party.kms.zama.ai";
+        let (ca_keypair, ca_cert, ca_cert_params) =
+            create_selfsigned_cert(ca_name, false, true).unwrap();
+        let issuing_ca = Issuer::from_params(&ca_cert_params, &ca_keypair);
+
+        let core_certs = create_core_certs(ca_name, 2, &issuing_ca, false).unwrap();
+
+        // check that we can import the CA cert into the trust store
+        let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
+        let cc = (*ca_cert.der()).clone();
+        root_store.add(cc).unwrap();
+
+        // create another CA cert, that did not sign the core certs for negative testing
+        let (_ca_keypair_wrong, ca_cert_wrong, _ca_cert_params_wrong) =
+            create_selfsigned_cert(ca_name, false, true).unwrap();
+
+        // check all core certs
+        for c in core_certs {
+            let verif = signed_verify(&c.1.1, &ca_cert);
+            // check that verification works for each core cert
+            assert!(verif.is_ok(), "certificate validation failed!");
+
+            // check that verification does not work for wrong CA cert
+            let verif = signed_verify(&c.1.1, &ca_cert_wrong);
+            assert!(
+                verif.is_err(),
+                "certificate validation succeeded, but was expected to fail!"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ca_cert_selfsigned_verify() {
+        let ca_name = "p1.kms.zama.ai";
+
+        let (ca_keypair, ca_cert, ca_cert_params) =
+            create_selfsigned_cert(ca_name, false, true).unwrap();
+
+        // check that we can import the CA cert into the trust store
+        let mut root_store = tokio_rustls::rustls::RootCertStore::empty();
+        let cc = (*ca_cert.der()).clone();
+        root_store.add(cc).unwrap();
+
+        // create another CA cert, that did not sign the core certs for negative testing
+        let (_ca_keypair_wrong, ca_cert_wrong, _ca_cert_params_wrong) =
+            create_selfsigned_cert(ca_name, false, true).unwrap();
+
+        let issuing_ca = Issuer::from_params(&ca_cert_params, &ca_keypair);
+        let core_certs = create_core_certs(ca_name, 2, &issuing_ca, false).unwrap();
+        // check that verification works for self-signed CA
+        for c in core_certs.iter() {
+            let verif = signed_verify(&c.1.1, &ca_cert);
+            assert!(verif.is_ok(), "certificate validation failed!");
+        }
+        // check that verification does not work for wrong CA cert
+        for c in core_certs {
+            let verif = signed_verify(&c.1.1, &ca_cert_wrong);
+            assert!(
+                verif.is_err(),
+                "certificate validation succeeded, but was expected to fail!"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ca_name_validation() {
+        assert!(
+            validate_ca_name("party").is_ok(),
+            "this should have been a valid CA name."
+        );
+        assert!(
+            validate_ca_name("party/is#bad!").is_err(),
+            "this should have been an invalid CA name."
+        );
+    }
+}

@@ -1,0 +1,754 @@
+use super::{Storage, StorageReader, StorageType, StoreWriteOutcome};
+use crate::consts::KEY_PATH_PREFIX;
+use crate::util::file_handling::{
+    safe_read_element_versioned, safe_write_element_versioned, sweep_stale_partials, write_bytes,
+};
+use crate::vault::storage::{StorageExt, StorageReaderExt, all_data_ids_from_all_epochs_impl};
+use crate::vault::storage_prefix_safety;
+use crate::{anyhow_error_and_log, some_or_err};
+use kms_grpc::RequestId;
+use kms_grpc::identifiers::EpochId;
+use serde::{Serialize, de::DeserializeOwned};
+use std::{
+    collections::HashSet,
+    env, fs,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
+use tfhe::{Unversionize, Versionize, named::Named};
+
+#[derive(Default, Clone, Debug)]
+pub struct FileStorage {
+    path: PathBuf,
+}
+
+impl FileStorage {
+    /// current_dir/keys/extra_prefix
+    pub fn root_dir(&self) -> &Path {
+        self.path.as_path()
+    }
+
+    /// Create a new storage directory.
+    ///
+    /// If [path] is None, set the storage directory to be
+    /// {current_dir}/keys/{extra_prefix}
+    /// Otherwise, set the storage directory to be
+    /// {path}/{extra_prefix}
+    /// {extra_prefix} is {storage_prefix} if it is Some,
+    /// otherwise it is set to {storage_type}.
+    /// All missing paths are created during this process.
+    /// Construction also sweeps stale partial-write temp files left under the
+    /// storage root by hard-crashed processes (see `sweep_stale_partials`).
+    pub fn new(
+        path: Option<&Path>,
+        storage_type: StorageType,
+        storage_prefix: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let extra_prefix = match storage_prefix {
+            Some(prefix) => {
+                storage_prefix_safety(storage_type, prefix)?;
+                prefix.to_string()
+            }
+            None => storage_type.to_string(),
+        };
+        let path = match path {
+            Some(path) => path.join(extra_prefix),
+            None => env::current_dir()?.join(KEY_PATH_PREFIX).join(extra_prefix),
+        };
+        fs::create_dir_all(&path)?;
+        let path = path.canonicalize()?;
+        sweep_stale_partials(&path);
+        Ok(Self { path })
+    }
+
+    fn item_path(&self, data_id: &RequestId, data_type: &str) -> PathBuf {
+        self.root_dir().join(data_type).join(data_id.to_string())
+    }
+
+    fn item_path_at_epoch(
+        &self,
+        data_id: &RequestId,
+        epoch_id: &EpochId,
+        data_type: &str,
+    ) -> PathBuf {
+        self.root_dir()
+            .join(data_type)
+            .join(epoch_id.to_string())
+            .join(data_id.to_string())
+    }
+
+    async fn item_exists_at_path(&self, path: &Path) -> anyhow::Result<bool> {
+        match tokio::fs::try_exists(path).await {
+            Ok(exists) => Ok(exists),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(anyhow_error_and_log(format!(
+                "Error checking path {}: {}",
+                path.display(),
+                e
+            ))),
+        }
+    }
+
+    /// Find all data under a given path.
+    /// If ensure_file_xor_directory flag is true, then only consider files,
+    /// otheriwse, only consider directories.
+    async fn all_data_from_path(
+        &self,
+        path: &Path,
+        ensure_file_xor_directory: bool,
+    ) -> anyhow::Result<HashSet<RequestId>> {
+        if !path.try_exists()? {
+            // If the path does not exist, then return an empty hashmap.
+            tracing::info!(
+                "The path {} does not exist, returning an empty map of URLs",
+                path.display(),
+            );
+            return Ok(HashSet::new());
+        }
+
+        let mut res = HashSet::new();
+        let mut files = tokio::fs::read_dir(path)
+            .await
+            .map_err(|e| anyhow::anyhow!("Could not read directory due to error {}!", e))?;
+        while let Some(cur_file) = files.next_entry().await? {
+            let cur_path = cur_file.path();
+
+            // if ensure_file_xor_directory is true, only consider files, else only consider directories
+            if (ensure_file_xor_directory && !cur_path.is_file())
+                || !ensure_file_xor_directory && !cur_path.is_dir()
+            {
+                continue;
+            }
+
+            let data_ptr = some_or_err(
+                some_or_err(
+                    cur_path.file_name(),
+                    "Could not convert path to OsStr".to_string(),
+                )?
+                .to_str(),
+                "Could not convert OsStr to string".to_string(),
+            )?
+            .to_string();
+            if data_ptr.starts_with('.') {
+                // Ignore hidden files
+                continue;
+            }
+            res.insert(RequestId::from_str(&data_ptr)?);
+        }
+        Ok(res)
+    }
+}
+
+impl StorageReader for FileStorage {
+    async fn data_exists(&self, data_id: &RequestId, data_type: &str) -> anyhow::Result<bool> {
+        let path = self.item_path(data_id, data_type);
+        self.item_exists_at_path(path.as_path()).await
+    }
+
+    async fn read_data<T: DeserializeOwned + Unversionize + Named + Send>(
+        &self,
+        data_id: &RequestId,
+        data_type: &str,
+    ) -> anyhow::Result<T> {
+        let path = self.item_path(data_id, data_type);
+        let res: T = safe_read_element_versioned(&path).await?;
+        Ok(res)
+    }
+
+    async fn load_bytes(&self, data_id: &RequestId, data_type: &str) -> anyhow::Result<Vec<u8>> {
+        let path = self.item_path(data_id, data_type);
+        tokio::fs::read(&path).await.map_err(|e| {
+            anyhow_error_and_log(format!(
+                "Could not load bytes from path {}: {}",
+                path.display(),
+                e
+            ))
+        })
+    }
+
+    /// Return all elements stored of a specific type as a hashmap of the `data_ptr` as key and the
+    /// `url` as value.
+    async fn all_data_ids(&self, data_type: &str) -> anyhow::Result<HashSet<RequestId>> {
+        let path = self.root_dir().join(data_type);
+        self.all_data_from_path(path.as_path(), true).await
+    }
+
+    fn info(&self) -> String {
+        format!(
+            "file storage with root_path \'{}\'",
+            self.root_dir().display()
+        )
+    }
+}
+
+impl StorageReaderExt for FileStorage {
+    async fn data_exists_at_epoch(
+        &self,
+        data_id: &RequestId,
+        epoch_id: &EpochId,
+        data_type: &str,
+    ) -> anyhow::Result<bool> {
+        let path = self.item_path_at_epoch(data_id, epoch_id, data_type);
+        self.item_exists_at_path(path.as_path()).await
+    }
+
+    async fn read_data_at_epoch<T: DeserializeOwned + Unversionize + Named + Send>(
+        &self,
+        data_id: &RequestId,
+        epoch_id: &EpochId,
+        data_type: &str,
+    ) -> anyhow::Result<T> {
+        let path = self.item_path_at_epoch(data_id, epoch_id, data_type);
+        let res: T = safe_read_element_versioned(&path).await?;
+        Ok(res)
+    }
+
+    async fn all_data_ids_at_epoch(
+        &self,
+        epoch_id: &EpochId,
+        data_type: &str,
+    ) -> anyhow::Result<HashSet<RequestId>> {
+        let path = self.root_dir().join(data_type).join(epoch_id.to_string());
+        self.all_data_from_path(path.as_path(), true).await
+    }
+
+    async fn all_epoch_ids_for_data(&self, data_type: &str) -> anyhow::Result<HashSet<EpochId>> {
+        let path = self.root_dir().join(data_type);
+        Ok(self
+            .all_data_from_path(path.as_path(), false)
+            .await?
+            .into_iter()
+            .map(|inner| inner.into())
+            .collect())
+    }
+
+    async fn all_data_ids_from_all_epochs(
+        &self,
+        data_type: &str,
+    ) -> anyhow::Result<HashSet<RequestId>> {
+        all_data_ids_from_all_epochs_impl(self, data_type)
+            .await
+            .map(|(ids, _)| ids)
+    }
+
+    async fn load_bytes_at_epoch(
+        &self,
+        data_id: &RequestId,
+        epoch_id: &EpochId,
+        data_type: &str,
+    ) -> anyhow::Result<Vec<u8>> {
+        let path = self.item_path_at_epoch(data_id, epoch_id, data_type);
+        tokio::fs::read(&path).await.map_err(|e| {
+            anyhow_error_and_log(format!(
+                "Could not load bytes from path {}: {}",
+                path.display(),
+                e
+            ))
+        })
+    }
+}
+
+impl Storage for FileStorage {
+    /// Store data with a specific [url], giving a warning if the data already exists and exits _without_ writing
+    async fn store_data<T: Serialize + Versionize + Named + Send + Sync>(
+        &mut self,
+        data: &T,
+        data_id: &RequestId,
+        data_type: &str,
+    ) -> anyhow::Result<StoreWriteOutcome> {
+        let path = self.item_path(data_id, data_type);
+        if self.data_exists(data_id, data_type).await? {
+            tracing::warn!(
+                "The path {} already exists. Keeping the data without overwriting",
+                path.display()
+            );
+            return Ok(StoreWriteOutcome::SkippedExisting);
+        }
+        safe_write_element_versioned(&path, data)
+            .await
+            .map_err(|e| {
+                tracing::warn!("Could not write to path {}: {}", path.display(), e);
+                e
+            })?;
+        Ok(StoreWriteOutcome::Created)
+    }
+
+    /// Store bytes with a specific [url], giving a warning if the data already exists and exits _without_ writing
+    async fn store_bytes(
+        &mut self,
+        bytes: &[u8],
+        data_id: &RequestId,
+        data_type: &str,
+    ) -> anyhow::Result<StoreWriteOutcome> {
+        let path = self.item_path(data_id, data_type);
+        if self.data_exists(data_id, data_type).await? {
+            tracing::warn!(
+                "The path {} already exists. Keeping the data without overwriting",
+                path.display()
+            );
+            return Ok(StoreWriteOutcome::SkippedExisting);
+        }
+        write_bytes(path.as_path(), bytes).await.map_err(|e| {
+            tracing::warn!("Could not write to path {}: {}", path.display(), e);
+            e
+        })?;
+        Ok(StoreWriteOutcome::Created)
+    }
+
+    async fn delete_data(&mut self, data_id: &RequestId, data_type: &str) -> anyhow::Result<()> {
+        let path = self.item_path(data_id, data_type);
+        Ok(tokio::fs::remove_file(&path).await?)
+    }
+}
+
+impl StorageExt for FileStorage {
+    async fn store_data_at_epoch<T: Serialize + Versionize + Named + Send + Sync>(
+        &mut self,
+        data: &T,
+        data_id: &RequestId,
+        epoch_id: &EpochId,
+        data_type: &str,
+    ) -> anyhow::Result<StoreWriteOutcome> {
+        let path = self.item_path_at_epoch(data_id, epoch_id, data_type);
+        if self
+            .data_exists_at_epoch(data_id, epoch_id, data_type)
+            .await?
+        {
+            tracing::warn!(
+                "The path {} already exists. Keeping the data without overwriting",
+                path.display()
+            );
+            return Ok(StoreWriteOutcome::SkippedExisting);
+        }
+        tracing::info!(
+            "Storing data {} at epoch {:?} at path {}",
+            data_type,
+            epoch_id,
+            path.display()
+        );
+        safe_write_element_versioned(&path, data)
+            .await
+            .map_err(|e| {
+                tracing::warn!("Could not write to path {}: {}", path.display(), e);
+                e
+            })?;
+        Ok(StoreWriteOutcome::Created)
+    }
+
+    async fn store_bytes_at_epoch(
+        &mut self,
+        bytes: &[u8],
+        data_id: &RequestId,
+        epoch_id: &EpochId,
+        data_type: &str,
+    ) -> anyhow::Result<StoreWriteOutcome> {
+        let path = self.item_path_at_epoch(data_id, epoch_id, data_type);
+        if self
+            .data_exists_at_epoch(data_id, epoch_id, data_type)
+            .await?
+        {
+            tracing::warn!(
+                "The path {} already exists. Keeping the data without overwriting",
+                path.display()
+            );
+            return Ok(StoreWriteOutcome::SkippedExisting);
+        }
+        write_bytes(path.as_path(), bytes).await.map_err(|e| {
+            tracing::warn!("Could not write to path {}: {}", path.display(), e);
+            e
+        })?;
+        Ok(StoreWriteOutcome::Created)
+    }
+
+    async fn delete_data_at_epoch(
+        &mut self,
+        data_id: &RequestId,
+        epoch_id: &EpochId,
+        data_type: &str,
+    ) -> anyhow::Result<()> {
+        let path = self.item_path_at_epoch(data_id, epoch_id, data_type);
+        tokio::fs::remove_file(&path).await?;
+
+        // Remove the epoch directory if it's now empty
+        if let Some(epoch_dir) = path.parent()
+            && let Ok(mut entries) = tokio::fs::read_dir(epoch_dir).await
+            && entries.next_entry().await?.is_none()
+        {
+            let _ = tokio::fs::remove_dir(epoch_dir).await;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+    use crate::{
+        consts::PUBLIC_STORAGE_PREFIX_THRESHOLD_ALL, engine::base::derive_request_id,
+        vault::storage::tests::*,
+    };
+    use kms_grpc::rpc_types::PubDataType;
+    use strum::IntoEnumIterator;
+
+    #[ignore]
+    #[tokio::test]
+    async fn threshold_dev_storage() {
+        let path1 = tempfile::tempdir().unwrap();
+        let path2 = tempfile::tempdir().unwrap();
+        let mut storage1 = FileStorage { path: path1.keep() };
+        let storage2 = FileStorage { path: path2.keep() };
+
+        // clear out storage
+        let _ = fs::remove_dir_all(storage1.root_dir());
+        let _ = fs::remove_dir_all(storage2.root_dir());
+
+        // urls should be empty
+        for data_type in PubDataType::iter() {
+            assert!(
+                storage1
+                    .all_data_ids(&data_type.to_string())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                storage2
+                    .all_data_ids(&data_type.to_string())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        let data = TestType { i: 13 };
+        let id = derive_request_id("ID").unwrap();
+        let wrong_id = derive_request_id("WRONG_ID").unwrap();
+        // make sure we can put it in storage1
+        assert!(
+            storage1
+                .store_data(&data, &id, &PubDataType::CRS.to_string())
+                .await
+                .is_ok()
+        );
+        assert!(
+            storage1
+                .data_exists(&id, &PubDataType::CRS.to_string())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !storage1
+                .data_exists(&wrong_id, &PubDataType::CRS.to_string())
+                .await
+                .unwrap()
+        );
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn threshold_file_storage_with_path() {
+        file_storage_with_path(true).await
+    }
+
+    #[ignore]
+    #[tokio::test]
+    async fn centralized_file_storage_with_path() {
+        file_storage_with_path(false).await
+    }
+
+    async fn file_storage_with_path(threshold: bool) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path();
+        let mut storage = if threshold {
+            FileStorage::new(
+                Some(path),
+                StorageType::PUB,
+                PUBLIC_STORAGE_PREFIX_THRESHOLD_ALL[0].as_deref(),
+            )
+            .unwrap()
+        } else {
+            FileStorage::new(Some(path), StorageType::PUB, None).unwrap()
+        };
+
+        let data = TestType { i: 23 };
+        let data_id = derive_request_id("ID").unwrap();
+        storage
+            .store_data(&data, &data_id, &PubDataType::CRS.to_string())
+            .await
+            .unwrap();
+
+        // manually check that the file actually exists
+        let data_path = if threshold {
+            path.join(format!("{}-p1", StorageType::PUB))
+                .join(PubDataType::CRS.to_string())
+                .join(data_id.to_string())
+        } else {
+            path.join(StorageType::PUB.to_string())
+                .join(PubDataType::CRS.to_string())
+                .join(data_id.to_string())
+        };
+        assert!(data_path.exists());
+
+        // drop the tempdir and it should disappear
+        drop(temp_dir);
+        assert!(!data_path.exists());
+    }
+
+    #[rstest::rstest]
+    #[tokio::test]
+    async fn storage_helper_methods(#[values(true, false)] threshold: bool) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path();
+        let mut pub_storage = if threshold {
+            FileStorage::new(
+                Some(path),
+                StorageType::PUB,
+                PUBLIC_STORAGE_PREFIX_THRESHOLD_ALL[0].as_deref(),
+            )
+            .unwrap()
+        } else {
+            FileStorage::new(Some(path), StorageType::PUB, None).unwrap()
+        };
+        let mut priv_storage = if threshold {
+            FileStorage::new(
+                Some(path),
+                StorageType::PRIV,
+                crate::consts::PRIVATE_STORAGE_PREFIX_THRESHOLD_ALL[0].as_deref(),
+            )
+            .unwrap()
+        } else {
+            FileStorage::new(Some(path), StorageType::PRIV, None).unwrap()
+        };
+        test_storage_read_store_methods(&mut pub_storage).await;
+        test_storage_read_store_methods(&mut priv_storage).await;
+        test_batch_helper_methods(&mut pub_storage).await;
+        test_batch_helper_methods(&mut priv_storage).await;
+        test_store_data_records_payload_size(&mut pub_storage).await;
+    }
+
+    /// Test that files don't get silently overwritten
+    #[tokio::test]
+    async fn test_overwrite_logic_files() {
+        // Setup temporary directory and storage
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path();
+        let mut storage = FileStorage::new(Some(path), StorageType::PUB, None).unwrap();
+        test_store_bytes_does_not_overwrite_existing_bytes(&mut storage).await;
+        test_store_data_does_not_overwrite_existing_data(&mut storage).await;
+    }
+
+    #[tokio::test]
+    async fn test_epoch_storage() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path();
+        let mut storage = FileStorage::new(Some(path), StorageType::PRIV, None).unwrap();
+        test_epoch_methods(&mut storage).await;
+    }
+
+    #[tokio::test]
+    async fn test_all_data_ids_from_all_epochs_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path();
+        let mut storage = FileStorage::new(Some(path), StorageType::PRIV, None).unwrap();
+        test_all_data_ids_from_all_epochs(&mut storage).await;
+    }
+
+    #[tokio::test]
+    async fn test_store_load_bytes_at_epoch_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path();
+        let mut storage = FileStorage::new(Some(path), StorageType::PRIV, None).unwrap();
+        test_store_load_bytes_at_epoch(&mut storage).await;
+    }
+
+    #[tokio::test]
+    async fn test_store_bytes_at_epoch_does_not_overwrite_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path();
+        let mut storage = FileStorage::new(Some(path), StorageType::PRIV, None).unwrap();
+        test_store_bytes_at_epoch_does_not_overwrite(&mut storage).await;
+    }
+
+    #[tokio::test]
+    async fn test_mixed_epoch_and_non_epoch_data_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path();
+        let mut storage = FileStorage::new(Some(path), StorageType::PRIV, None).unwrap();
+        test_all_epoch_ids_and_data_ids_with_mixed_storage(&mut storage).await;
+    }
+
+    #[tokio::test]
+    async fn test_epoch_ids_with_only_non_epoch_data_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path();
+        let mut storage = FileStorage::new(Some(path), StorageType::PRIV, None).unwrap();
+        test_all_epoch_ids_for_data_with_only_non_epoch_data(&mut storage).await;
+    }
+
+    #[tokio::test]
+    async fn test_data_ids_with_only_epoch_data_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path();
+        let mut storage = FileStorage::new(Some(path), StorageType::PRIV, None).unwrap();
+        test_all_data_ids_with_only_epoch_data(&mut storage).await;
+    }
+
+    #[tokio::test]
+    async fn test_delete_at_epoch_removes_empty_epoch_dir() {
+        use aes_prng::AesRng;
+        use kms_grpc::rpc_types::PrivDataType;
+        use rand::SeedableRng;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path();
+        let mut storage = FileStorage::new(Some(path), StorageType::PRIV, None).unwrap();
+
+        let mut rng = AesRng::seed_from_u64(42);
+        let epoch_id = kms_grpc::identifiers::EpochId::new_random(&mut rng);
+        let data_id = derive_request_id("TEST_DATA").unwrap();
+        let data_type = PrivDataType::FheKeyInfo.to_string();
+
+        let data = TestType { i: 99 };
+
+        // Store data at epoch
+        storage
+            .store_data_at_epoch(&data, &data_id, &epoch_id, &data_type)
+            .await
+            .unwrap();
+
+        // Verify the epoch directory exists
+        let epoch_dir = storage
+            .root_dir()
+            .join(&data_type)
+            .join(epoch_id.to_string());
+        assert!(
+            epoch_dir.exists(),
+            "Epoch directory should exist after storing data"
+        );
+
+        // Delete the data
+        storage
+            .delete_data_at_epoch(&data_id, &epoch_id, &data_type)
+            .await
+            .unwrap();
+
+        // Verify the epoch directory is removed since it's now empty
+        assert!(
+            !epoch_dir.exists(),
+            "Epoch directory should be removed after deleting the last file"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_at_epoch_keeps_dir_when_not_empty() {
+        use aes_prng::AesRng;
+        use kms_grpc::rpc_types::PrivDataType;
+        use rand::SeedableRng;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path();
+        let mut storage = FileStorage::new(Some(path), StorageType::PRIV, None).unwrap();
+
+        let mut rng = AesRng::seed_from_u64(42);
+        let epoch_id = kms_grpc::identifiers::EpochId::new_random(&mut rng);
+        let data_id_1 = derive_request_id("TEST_DATA_1").unwrap();
+        let data_id_2 = derive_request_id("TEST_DATA_2").unwrap();
+        let data_type = PrivDataType::FheKeyInfo.to_string();
+
+        let data1 = TestType { i: 1 };
+        let data2 = TestType { i: 2 };
+
+        // Store two items at the same epoch
+        storage
+            .store_data_at_epoch(&data1, &data_id_1, &epoch_id, &data_type)
+            .await
+            .unwrap();
+        storage
+            .store_data_at_epoch(&data2, &data_id_2, &epoch_id, &data_type)
+            .await
+            .unwrap();
+
+        let epoch_dir = storage
+            .root_dir()
+            .join(&data_type)
+            .join(epoch_id.to_string());
+        assert!(epoch_dir.exists(), "Epoch directory should exist");
+
+        // Delete only the first item
+        storage
+            .delete_data_at_epoch(&data_id_1, &epoch_id, &data_type)
+            .await
+            .unwrap();
+
+        // Epoch directory should still exist because data_id_2 is still there
+        assert!(
+            epoch_dir.exists(),
+            "Epoch directory should still exist when other files remain"
+        );
+
+        // Verify data_id_2 still exists and is readable
+        let retrieved: TestType = storage
+            .read_data_at_epoch(&data_id_2, &epoch_id, &data_type)
+            .await
+            .unwrap();
+        assert_eq!(retrieved.i, 2);
+
+        // Now delete the second item
+        storage
+            .delete_data_at_epoch(&data_id_2, &epoch_id, &data_type)
+            .await
+            .unwrap();
+
+        // Now the epoch directory should be removed
+        assert!(
+            !epoch_dir.exists(),
+            "Epoch directory should be removed after deleting the last file"
+        );
+    }
+
+    #[tokio::test]
+    async fn filestorage_new_sweeps_stale_partials() {
+        use crate::util::file_handling::partial_file_name;
+        use std::ffi::OsStr;
+        // Cannot be a live pid; see the twin constant in the file_handling tests.
+        const NEVER_LIVE_PID: u32 = 999_999_999;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut storage = FileStorage::new(Some(temp_dir.path()), StorageType::PRIV, None).unwrap();
+        let data = TestType { i: 13 };
+        let data_type = "TestType";
+        let req_id = derive_request_id("sweep_plain").unwrap();
+        storage.store_data(&data, &req_id, data_type).await.unwrap();
+
+        // Plant orphans of a dead process next to plain and epoch data, plus an
+        // in-flight partial of this very process.
+        let type_dir = storage.root_dir().join(data_type);
+        let epoch_dir = type_dir.join("epoch1");
+        fs::create_dir_all(&epoch_dir).unwrap();
+        let orphan_plain =
+            type_dir.join(partial_file_name(OsStr::new("orphan"), NEVER_LIVE_PID, 3));
+        let orphan_epoch =
+            epoch_dir.join(partial_file_name(OsStr::new("orphan"), NEVER_LIVE_PID, 4));
+        let inflight = type_dir.join(partial_file_name(
+            OsStr::new("inflight"),
+            std::process::id(),
+            5,
+        ));
+        for planted in [&orphan_plain, &orphan_epoch, &inflight] {
+            fs::write(planted, b"junk").unwrap();
+        }
+
+        // Re-opening the same root sweeps dead-pid partials only.
+        let storage2 = FileStorage::new(Some(temp_dir.path()), StorageType::PRIV, None).unwrap();
+        assert!(!orphan_plain.exists(), "plain orphan not swept");
+        assert!(!orphan_epoch.exists(), "epoch orphan not swept");
+        assert!(inflight.exists(), "in-flight partial of a live pid removed");
+
+        // Real data survives and listings are unchanged.
+        let read_back: TestType = storage2.read_data(&req_id, data_type).await.unwrap();
+        assert_eq!(read_back, data);
+        let ids = storage2.all_data_ids(data_type).await.unwrap();
+        assert!(ids.contains(&req_id));
+        assert_eq!(ids.len(), 1);
+    }
+}

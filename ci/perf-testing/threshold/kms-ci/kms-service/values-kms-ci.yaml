@@ -1,0 +1,138 @@
+kmsPeers:
+  # Number of replicas managed by each statefulset
+  count: 1
+kmsConnector:
+  enabled: false
+kmsCoreClient:
+  enabled: false
+  envFrom:
+    configmap:
+      name: kms-ci-1
+  image:
+    tag: <version>
+
+kubeUtils:
+  image:
+    name: hub.zama.org/ghcr/zama-ai/security-hub/infra/kube-utils
+    tag: v0.4.0
+    pullPolicy: Always
+
+kmsCore:
+  image:
+    name: hub.zama.org/ghcr/zama-ai/kms/core-service
+    tag: <version>
+
+  envFrom:
+    configmap:
+      key:
+        coreClientS3Endpoint: CORE_CLIENT__S3_ENDPOINT
+        privateVaultStorageBucket: KMS_CORE__PRIVATE_VAULT__STORAGE__S3__BUCKET
+        privateVaultStoragePrefix: KMS_CORE__PRIVATE_VAULT__STORAGE__S3__PREFIX
+        publicVaultStorageBucket: KMS_CORE__PUBLIC_VAULT__STORAGE__S3__BUCKET
+        publicVaultStoragePrefix: KMS_CORE__PUBLIC_VAULT__STORAGE__S3__PREFIX
+  rateLimiter:
+    bucketSize: 50000
+  thresholdMode:
+    enabled: true
+    initializationScript:
+      enabled: true
+    tls:
+      enabled: false
+    thresholdValue: 4 # 1 if 4 parties or 4 if 13 parties
+    numSessionsPreproc: 72
+    multiplier: 2.0
+    maxInterval: 60
+    initialIntervalMs: 100
+    cleanupIntervalSecs: 2
+    # NOTE: these thread counts are also printed in the perf Slack report; they are hardcoded
+    # in the report's config line (ci/perf-testing/argo-workflow/*-workflow-*.yaml). Update them
+    # there too when changing these values, or the report will misstate the deployed config.
+    tokioWorkerThreads: 10
+    rayonNumThreads: 40
+    # peersList is generated dynamically by deploy.sh and should not be set here
+  aws:
+    region: eu-west-1
+  publicVault:
+    s3:
+      enabled: true
+      prefix:
+  privateVault:
+    s3:
+      enabled: true
+      prefix:
+  storage:
+    storageClassName: gp3
+    capacity: 5Gi
+  serviceMonitor:
+    enabled: false
+  resources:
+    requests:
+      memory: 96Gi
+      cpu: 48
+    limits:
+      memory: 96Gi
+      ephemeralStorage: 1Gi
+      grpcTimeout: 360
+      grpcMaxMessageSize: 104857600
+  nodeSelector:
+    karpenter.sh/nodepool: kms-bench-spot-64
+  tolerations:
+    - key: karpenter.sh/nodepool
+      effect: NoSchedule
+      operator: Equal
+      value: kms-bench-spot-64
+mtls:
+  enabled: false
+environment: dev
+runMode: dev
+tracing:
+  enabled: false
+  endpoint: "http://observability-zws-dev-observability-alloy.observability.svc.cluster.local:4317"
+
+# NOTE: do NOT override socat.image with a stock image (e.g. alpine/socat). The
+# config init container (kms-core-init-load-env) runs `envsubst`, which
+# alpine/socat lacks — that silently emitted empty kms-*.toml and broke
+# non-enclave threshold deploys (gen-keys got no config). Inherit the chart
+# default (Zama socat, has envsubst), same as the enclave path.
+rustLog: info
+minio:
+  enabled: false
+kyverno:
+  enabled: false
+kmsInit:
+  enabled: false
+kmsGenKeys:
+  enabled: false
+# Cronjob kubernetes
+# Store the key-id and crs-id in files for later use in /app/key-files volume
+# Then launch a test of the KMS core client
+
+kmsCoreClientTesting:
+  enabled: false
+  # schedule: "5 * * * *"
+  shell_command:
+    - date
+    - ./bin/kms-core-client --logs --max-iter 1200 -f config.toml preproc-key-gen
+    - date
+    # kmsCoreClientTesting:
+  # enabled: true
+  # schedule: "40 * * * *"
+  # shell_command:
+  # - echo "######################################################################"
+  # - echo "Launching testing core-client"
+  # - echo ""
+  # - echo ""
+  # - echo "######################################################################"
+  # - echo ""
+  # - if [ ! -f "/app/key-files/key-id.txt" ] && [ ! -f "/app/key-files/crs-id.txt" ]; then echo "Launching insecure key generation"; result_key_id=$(bin/kms-core-client -f config.toml insecure-key-gen); echo "######################################################################"; echo "Launching insecure crs generation"; result_crs_id=$(bin/kms-core-client -f config.toml insecure-crs-gen --max-num-bits 128); key_id=$(echo $result_key_id | grep request_id | cut -d'"' -f4); crs_id=$(echo $result_crs_id | grep request_id | cut -d'"' -f4); echo "${key_id}" > /app/key-files/key-id.txt; echo "${crs_id}" > /app/key-files/crs-id.txt;
+  # - fi
+  # - key_id=$(cat /app/key-files/key-id.txt)
+  # - crs_id=$(cat /app/key-files/crs-id.txt)
+  # - bin/kms-core-client --logs -f config.toml public-decrypt from-args -d euint64 -k $key_id -e ffffffffffffffff --rate 100 --duration 60
+  # - bin/kms-core-client --logs -f config.toml user-decrypt from-args -d euint64 -k $key_id -e ffffffffffffffff --precompute-sns --rate 100 --duration 1 --max-in-flight 1000
+podSecurityContext:
+  # To set when the image will support non root user
+  runAsUser: 10003
+  runAsGroup: 10002
+  fsGroup: 10002
+  runAsNonRoot: true

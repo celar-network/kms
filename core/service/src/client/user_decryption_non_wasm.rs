@@ -1,0 +1,81 @@
+use crate::client::client_wasm::Client;
+use crate::consts::SAFE_SER_SIZE_LIMIT;
+use crate::cryptography::encryption::{
+    Encryption, PkeScheme, PkeSchemeType, UnifiedPrivateEncKey, UnifiedPublicEncKey,
+};
+use crate::{anyhow_error_and_log, some_or_err};
+use alloy_sol_types::Eip712Domain;
+use kms_grpc::RequestId;
+use kms_grpc::kms::v1::SigningSchemeType;
+use kms_grpc::kms::v1::{TypedCiphertext, UserDecryptionRequest};
+use kms_grpc::rpc_types::alloy_to_protobuf_domain;
+use kms_grpc::{ContextId, EpochId};
+
+impl Client {
+    /// Creates a user decryption request to send to the KMS servers.
+    /// Returns the full [UserDecryptionRequest] containing
+    /// the payload to send to the servers, along with the generated
+    /// user decryption key pair.
+    /// The private key is used to decrypt the responses from the servers,
+    /// and must be kept to process the responses.
+    ///
+    /// Note that we only support MlKem512 in the latest version and not other variants of MlKem.
+    #[allow(unknown_lints)]
+    // We allow modifying the internal rng before return
+    #[allow(non_local_effect_before_error_return, clippy::too_many_arguments)]
+    pub fn user_decryption_request(
+        &mut self,
+        domain: &Eip712Domain,
+        typed_ciphertexts: Vec<TypedCiphertext>,
+        request_id: &RequestId,
+        key_id: &RequestId,
+        context_id: Option<&ContextId>,
+        epoch_id: Option<&EpochId>,
+        extra_data: &[u8],
+    ) -> anyhow::Result<(
+        UserDecryptionRequest,
+        UnifiedPublicEncKey,
+        UnifiedPrivateEncKey,
+    )> {
+        if !request_id.is_valid() {
+            return Err(anyhow_error_and_log(format!(
+                "The request id format is not valid {request_id}"
+            )));
+        }
+        let _client_sk = some_or_err(
+            self.client_sk.clone(),
+            "missing client signing key".to_string(),
+        )?;
+
+        let domain_msg = alloy_to_protobuf_domain(domain)?;
+
+        let mut encryption = Encryption::new(PkeSchemeType::MlKem512, &mut self.rng);
+        let (enc_sk, enc_pk) = encryption.keygen()?;
+
+        Ok((
+            UserDecryptionRequest {
+                request_id: Some((*request_id).into()),
+                enc_key: {
+                    let mut buf = Vec::new();
+                    tfhe::safe_serialization::safe_serialize(
+                        &enc_pk,
+                        &mut buf,
+                        SAFE_SER_SIZE_LIMIT,
+                    )
+                    .expect("Failed to serialize ephemeral encryption key");
+                    buf
+                },
+                client_address: self.client_address.to_checksum(None),
+                typed_ciphertexts,
+                key_id: Some((*key_id).into()),
+                domain: Some(domain_msg),
+                extra_data: extra_data.to_vec(),
+                context_id: context_id.map(|c| (*c).into()),
+                epoch_id: epoch_id.map(|e| (*e).into()),
+                signing_schemes: vec![SigningSchemeType::Ecdsa256k1 as i32],
+            },
+            enc_pk,
+            enc_sk,
+        ))
+    }
+}
